@@ -5,11 +5,14 @@ import cv2
 import numpy as np
 from PIL.ImageQt import ImageQt
 from PIL import Image
-
-
 from PySide6.QtWidgets import *
 from PySide6.QtCore import *
 from PySide6.QtGui import *
+import subprocess
+import tempfile
+import parsel
+
+
 
 
 def cvToImage(img):
@@ -35,7 +38,6 @@ class Window(QMainWindow):
         self.open_button = QPushButton("Open")
         vlayout.addWidget(self.open_button)
         vlayout.addWidget(self.list_widget)
-        self.list_widget.setHeaderHidden(True)
         self.leftside.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred))
         self.vlayout = QVBoxLayout()
         self.hlayout = QHBoxLayout()
@@ -53,29 +55,84 @@ class Window(QMainWindow):
         self.open_button.clicked.connect(self.open_new_pdf)
         self.add_toolbar_buttons()
         self.set_default_pdf()
-        self.tree_widget.currentItemChanged.connect(self.highlight_label)
+        self.list_widget.currentItemChanged.connect(self.highlight_label)
         self.resize(900,800)
+        self.list_widget.sizePolicy().setHorizontalPolicy(QSizePolicy.Policy.Fixed)
+        self.list_widget.installEventFilter(self)
+
+    def extract_text(self, img):
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmpfile = tmp.name
+            cv2.imwrite(tmpfile, img)
+            hocr = subprocess.check_output(f"tesseract {tmpfile} stdout --psm 11 -l eng hocr", stderr=subprocess.STDOUT, shell=True)
+            self.hocr = hocr.decode("utf-8")
+        selector = parsel.Selector(self.hocr)
+        return selector
+
+    def ocr_img(self):
+        item = self.get_selected_item()
+        if not item: return
+        img = item.image
+        response = self.extract_text(img)
+        nimg = img.copy()
+        for elem in response.xpath("//span[@class='ocrx_word']"):
+            bbox = elem.xpath("./@title").get()
+            bbox = bbox[4:bbox.index(";")]
+            rect = [int(i) for i in bbox.split()]
+            nimg[rect[1]:rect[3], rect[0]:rect[2]] = 255
+        child = QListWidgetItem()
+        child.setText(item.text() + "-ocred")
+        child.image = nimg
+        self.add_image_to_grid(nimg, child)
+        self.list_widget.addItem(child)
+
+    def eventFilter(self, widget, event):
+        if event.type() == QEvent.Type.KeyPress:
+            if event.keyCombination().key()._name_ == "Key_Delete":
+                self.delete_seleced_items()
+        return False
+
+    def delete_seleced_items(self):
+        items = self.list_widget.selectedItems()
+        for item in items:
+            index = self.list_widget.indexFromItem(item)
+            item = self.list_widget.takeItem(index.row())
+            label = item.label
+            self.grid.removeWidget(label)
+            label.deleteLater()
+        litems = []
+        for i in range(self.grid.count()):
+            litem = self.grid.takeAt(i)
+            litems.append(litem)
+        self.row = self.col = 0
+        while len(litems) > 0:
+            litem = litems.pop(0)
+            self.grid.addWidget(litem.widget(), self.row, self.col)
+            if self.col > 2:
+                self.col = 0
+                self.row += 1
+            else:
+                self.col += 1
+
+    def set_default_pdf(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "pdf", "T2.pdf")
+        self.open_new_pdf(path)
 
     def clear_label_selection(self):
-        for i in range(self.tree_widget.topLevelItemCount()):
-            item = self.tree_widget.topLevelItem(i)
-            def deselect_children(root):
-                label = root.label
-                label.setStyleSheet("border: solid transparent 0px;")
-                for j in range(root.childCount()):
-                    child = root.child(j)
-                    deselect_children(child)
-            deselect_children(item)
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            label = item.label
+            label.setStyleSheet("border: solid transparent 0px;")
 
     def highlight_label(self, item):
         self.clear_label_selection()
-        label = item.label
-        label.setStyleSheet("border: 3px solid cyan;")
-
-
+        if item:
+            label = item.label
+            label.setStyleSheet("border: 3px solid cyan;")
 
     def get_selected_item(self):
-        items = self.tree_widget.selectedItems()
+        items = self.list_widget.selectedItems()
         if not items:
             return None
         return items[0]
@@ -90,8 +147,6 @@ class Window(QMainWindow):
         child.image = newimg
         self.add_image_to_grid(newimg, child)
         self.list_widget.addItem(child)
-
-
 
     def add_image_to_grid(self, img, item):
         label = QLabel()
@@ -120,8 +175,6 @@ class Window(QMainWindow):
         child.image = newimg
         self.add_image_to_grid(newimg, child)
         self.list_widget.addItem(child)
-
-
 
     def add_toolbar_buttons(self):
         self.gray_button = QToolButton(self)
@@ -162,6 +215,25 @@ class Window(QMainWindow):
         self.erode_button.setText("erode")
         self.erode_button.clicked.connect(self.erode)
         self.toolbar.addWidget(self.erode_button)
+        self.thresh_std_button = QToolButton()
+        self.thresh_std_button.setText("Thresh. Std.")
+        self.thresh_std_button.clicked.connect(self.thresh_std)
+        self.toolbar.addWidget(self.thresh_std_button)
+        self.extract_button = QToolButton()
+        self.extract_button.setText("OCR")
+        self.extract_button.clicked.connect(self.ocr_img)
+        self.toolbar.addWidget(self.extract_button)
+
+    def thresh_std(self):
+        item = self.get_selected_item()
+        if not item: return
+        img = item.image
+        _, thresh = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        child = QListWidgetItem()
+        child.setText(item.text() + f"-thresh.std")
+        child.image = thresh
+        self.add_image_to_grid(thresh, child)
+        self.list_widget.addItem(child)
 
     def dilate_image(self):
         item = self.get_selected_item()
@@ -169,14 +241,12 @@ class Window(QMainWindow):
         img = item.image
         value = self.dilate_spinbox.value()
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (value,value))
-        dilate = cv2.dilate(img, kernel, iterations=4)
+        dilate = cv2.dilate(img, kernel, iterations=3)
         child = QListWidgetItem()
-        child.setText(item.text() + f"-dilate")
+        child.setText(item.text() + f"-dilate{value}")
         child.image = dilate
         self.add_image_to_grid(dilate, child)
         self.list_widget.addItem(child)
-
-
 
     def apply_threshold(self):
         item = self.get_selected_item()
@@ -185,7 +255,7 @@ class Window(QMainWindow):
         value = self.thresh_spinbox.value()
         thresh = cv2.adaptiveThreshold(img,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV,11,value)
         child = QListWidgetItem()
-        child.setText(item.text() + f"-thresh")
+        child.setText(item.text() + f"-thresh.adap{value}")
         child.image = thresh
         self.add_image_to_grid(thresh, child)
         self.list_widget.addItem(child)
@@ -195,18 +265,16 @@ class Window(QMainWindow):
         if not item: return
         img = item.image
         height, width = img.shape
-        vertical_kernel_height = math.ceil(height*0.3)
-        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vertical_kernel_height))
-        horizontal_kernel_width = math.ceil(width*0.3)
-        hori_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (horizontal_kernel_width, 1))
+        kh, kw = int(10), int(width * .05)
+        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kh))
+        hori_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, 1))
         for tag, kernel in [("v",vertical_kernel), ("h", hori_kernel)]:
-            eroded = cv2.erode(img, kernel, iterations=3)
+            eroded = cv2.morphologyEx(img, cv2.MORPH_OPEN, kernel, iterations=3)
             child = QListWidgetItem()
             child.setText(item.text() + f"{tag}-erode")
             child.image = eroded
             self.add_image_to_grid(eroded, child)
-        self.list_widget.addItem(child)
-
+            self.list_widget.addItem(child)
 
     def open_new_pdf(self, filepath=None):
         if filepath is None:
@@ -217,22 +285,17 @@ class Window(QMainWindow):
         else:
             filename = os.path.basename(filepath)
         doc = fitz.open(filepath)
-        mat = fitz.Matrix(2.0, 2.0)
+        mat = fitz.Matrix(2, 2.1)
         for page in doc.pages():
             pix = page.get_pixmap(matrix=mat)
             img = np.frombuffer(buffer=pix.samples, dtype=np.uint8).reshape(
                 (pix.height, pix.width, 3)
             )
-            treeitem = QListWidgetItem()
-            treeitem.setText(0, filename)
-            treeitem.image = img
-            self.tree_widget.addTopLevelItem(treeitem)
-            self.add_image_to_grid(img, treeitem)
-
-
-
-
-
+            listitem = QListWidgetItem()
+            listitem.setText(filename)
+            listitem.image = img
+            self.list_widget.addItem(listitem)
+            self.add_image_to_grid(img, listitem)
 
 
 if __name__ == "__main__":
