@@ -13,6 +13,18 @@ import tempfile
 import parsel
 
 
+THRESH_TYPES = {
+    "THRESH_BINARY": cv2.THRESH_BINARY,
+    "THRESH_BINARY_INV": cv2.THRESH_BINARY_INV,
+    "THRESH_TRUNC": cv2.THRESH_TRUNC,
+    "THRESH_TOZERO": cv2.THRESH_TOZERO,
+    "THRESH_TOZERO_INV": cv2.THRESH_TOZERO_INV,
+    "THRESH_MASK": cv2.THRESH_MASK,
+    "THRESH_OTSU": cv2.THRESH_OTSU,
+    "THRESH_TRIANGLE": cv2.THRESH_TRIANGLE,
+}
+
+
 
 
 def cvToImage(img):
@@ -32,6 +44,7 @@ class Window(QMainWindow):
         self.toolbar = QToolBar(self)
         self.list_widget = QListWidget(self)
         self.scroll_area = QScrollArea(self)
+        self.contours_button = QPushButton("Contours")
         self.scroll_widget = QWidget()
         self.leftside = QWidget()
         vlayout = QVBoxLayout(self.leftside)
@@ -100,19 +113,24 @@ class Window(QMainWindow):
             label = item.label
             self.grid.removeWidget(label)
             label.deleteLater()
-        litems = []
-        for i in range(self.grid.count()):
-            litem = self.grid.takeAt(i)
-            litems.append(litem)
-        self.row = self.col = 0
-        while len(litems) > 0:
-            litem = litems.pop(0)
-            self.grid.addWidget(litem.widget(), self.row, self.col)
-            if self.col > 2:
-                self.col = 0
-                self.row += 1
-            else:
-                self.col += 1
+        empty = []
+        for row in range(self.grid.rowCount()):
+            for column in range(self.grid.columnCount()):
+                item = self.grid.itemAtPosition(row, column)
+                if not item or not item.widget():
+                    empty.append((row, column))
+                else:
+                    if len(empty) > 0:
+                        r,c = empty.pop(0)
+                        for i in range(self.grid.count()):
+                            if self.grid.itemAt(i) == item:
+                                j = self.grid.takeAt(i)
+                                self.grid.addWidget(j.widget(), r, c)
+                                break
+        if len(empty) > 0:
+            r,c = empty.pop(0)
+            self.row = r
+            self.col = c
 
     def set_default_pdf(self):
         root = os.path.dirname(os.path.dirname(__file__))
@@ -150,7 +168,8 @@ class Window(QMainWindow):
 
     def add_image_to_grid(self, img, item):
         label = QLabel()
-        image = cvToImage(img).scaledToWidth(400)
+        val = int(img.shape[1] * .50)
+        image = cvToImage(img).scaledToWidth(val)
         pixmap = QPixmap.fromImage(image)
         label.setPixmap(pixmap)
         if self.col < 2:
@@ -194,7 +213,7 @@ class Window(QMainWindow):
         self.thresh_groupbox = QGroupBox()
         self.thresh_layout = QHBoxLayout(self.thresh_groupbox)
         self.thresh_spinbox = QSpinBox()
-        self.thresh_spinbox.setRange(0,25)
+        self.thresh_spinbox.setRange(-25,25)
         self.thresh_button = QToolButton()
         self.thresh_button.setText("Adap. Thresh.")
         self.thresh_button.clicked.connect(self.apply_threshold)
@@ -204,7 +223,7 @@ class Window(QMainWindow):
         self.dilate_groupbox = QGroupBox()
         self.dilate_layout = QHBoxLayout(self.dilate_groupbox)
         self.dilate_spinbox = QSpinBox()
-        self.dilate_spinbox.setRange(0,25)
+        self.dilate_spinbox.setRange(-25,25)
         self.dilate_button = QToolButton()
         self.dilate_button.setText("Dilate")
         self.dilate_button.clicked.connect(self.dilate_image)
@@ -215,20 +234,33 @@ class Window(QMainWindow):
         self.erode_button.setText("erode")
         self.erode_button.clicked.connect(self.erode)
         self.toolbar.addWidget(self.erode_button)
+        self.thresh_std_groupbox = QGroupBox()
+        self.thresh_std_layout = QHBoxLayout(self.thresh_std_groupbox)
+        self.thresh_std_spinbox = QSpinBox()
         self.thresh_std_button = QToolButton()
+        self.thresh_std_combo = QComboBox()
+        for i in THRESH_TYPES:
+            self.thresh_std_combo.addItem(i)
+        self.thresh_std_spinbox.setRange(-255,255)
         self.thresh_std_button.setText("Thresh. Std.")
+        self.thresh_std_layout.addWidget(self.thresh_std_button)
+        self.thresh_std_layout.addWidget(self.thresh_std_spinbox)
+        self.thresh_std_layout.addWidget(self.thresh_std_combo)
         self.thresh_std_button.clicked.connect(self.thresh_std)
-        self.toolbar.addWidget(self.thresh_std_button)
+        self.toolbar.addWidget(self.thresh_std_groupbox)
         self.extract_button = QToolButton()
         self.extract_button.setText("OCR")
         self.extract_button.clicked.connect(self.ocr_img)
         self.toolbar.addWidget(self.extract_button)
 
     def thresh_std(self):
+        value = self.thresh_std_spinbox.value()
+        typ = self.thresh_std_combo.currentText()
+        thresh_type = THRESH_TYPES[typ]
         item = self.get_selected_item()
         if not item: return
         img = item.image
-        _, thresh = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, thresh = cv2.threshold(img, value, 255, thresh_type)
         child = QListWidgetItem()
         child.setText(item.text() + f"-thresh.std")
         child.image = thresh
@@ -268,11 +300,13 @@ class Window(QMainWindow):
         kh, kw = int(10), int(width * .05)
         vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kh))
         hori_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, 1))
+        self.contours = []
         for tag, kernel in [("v",vertical_kernel), ("h", hori_kernel)]:
             eroded = cv2.morphologyEx(img, cv2.MORPH_OPEN, kernel, iterations=3)
             child = QListWidgetItem()
             child.setText(item.text() + f"{tag}-erode")
             child.image = eroded
+            self.contours.append(eroded)
             self.add_image_to_grid(eroded, child)
             self.list_widget.addItem(child)
 
@@ -296,6 +330,9 @@ class Window(QMainWindow):
             listitem.image = img
             self.list_widget.addItem(listitem)
             self.add_image_to_grid(img, listitem)
+
+
+
 
 
 if __name__ == "__main__":
