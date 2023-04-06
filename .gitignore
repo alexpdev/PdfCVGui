@@ -1,2 +1,6 @@
 venv/
 pdf/
+pdfs/
+results/
+.vscode/
+__pycache__/
