@@ -1,11 +1,13 @@
 from pathlib import Path
 import os
 import logging
+from queue import Queue, Empty
 from PySide6.QtWidgets import *
 from PySide6.QtCore import *
 from PySide6.QtGui import *
 from PdfCVGui.pdfviewer import MyGraphicsView
 from PdfCVGui.main import run_main
+import tabula
 
 PARENT = os.path.dirname(__file__)
 ROOT = os.path.dirname(PARENT)
@@ -30,6 +32,8 @@ class ToolBar(QToolBar):
         self.label = QLabel("Page -/-")
         self.singlePage.setCheckable(True)
         self.singlePage.setChecked(True)
+        self.tabulabtn = QAction()
+        self.tabulabtn.setText("Tabula")
         self.addAction(self.transferbtn)
         self.addWidget(self.singlePage)
         self.addSeparator()
@@ -37,6 +41,8 @@ class ToolBar(QToolBar):
         self.addAction(self.backbtn)
         self.addWidget(self.label)
         self.addAction(self.nextbtn)
+        self.addSeparator()
+        self.addAction(self.tabulabtn)
         self.setOrientation(Qt.Horizontal)
         self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
 
@@ -69,6 +75,7 @@ class ViewerTab(QWidget):
         self.toolbar        = ToolBar()
         self.pdfscene       = QGraphicsScene()
         self.pdfview        = MyGraphicsView(self.pdfscene)
+        self.queue          = Queue()
 
         self.hlay.addWidget(self.file_btn)
         self.hlay.addWidget(self.folder_btn)
@@ -91,21 +98,44 @@ class ViewerTab(QWidget):
         self.toolbar.backbtn.triggered.connect(self.pdfview.prev_page)
         self.toolbar.transferbtn.triggered.connect(self.transfer_page)
         self.pdfview.currentPageChanged.connect(self.toolbar.change_page)
+        self.toolbar.tabulabtn.triggered.connect(self.run_tabula)
         self.showPdf.connect(self.pdfview.load_pdf)
+        self.procThread = None
         self.load_icons_images()
         self.load_default_folder()
+
+    def run_tabula(self):
+        for item in self.files_widget.selectedItems():
+            path = item.path
+            dfs = tabula.read_pdf(path, pages="all")
+            tabula.convert_into(path, "output.csv", output_format="csv", pages="all")
+            print(len(dfs))
+            dfs[0]
+
+
 
     def load_default_folder(self):
         if os.path.exists(PDFS):
             self.load_folder(Path(PDFS))
 
     def process_all_files(self):
-        if not os.path.exists(RESULTS):
-            os.mkdir(RESULTS)
         for i in range(self.files_widget.count()):
             item = self.files_widget.item(i)
             path = Path(item.path)
-            run_main(path)
+            self.queue.put([path, i])
+        if not self.procThread:
+            self.procThread = ProcThread(self.queue, self)
+            self.procThread.finished.connect(self.procThread.deleteLater)
+            self.procThread.procStarted.connect(self.on_proc_started)
+            self.procThread.procStopped.connect(self.on_proc_stopped)
+            self.procThread.run()
+
+    def on_proc_started(self, row):
+        pass
+
+    def on_proc_stopped(self, row):
+        pass
+
 
     def transfer_page(self):
         page_no = self.pdfview.page_number
@@ -190,3 +220,23 @@ class ViewerTab(QWidget):
 
     def setThreadName(self, first, last):
         self.thread.chosen_name = first + last
+
+
+class ProcThread(QThread):
+    procStarted = Signal(int)
+    procStopped = Signal(int)
+
+    def __init__(self, queue, parent=None):
+        super().__init__(parent=parent)
+        self.queue = queue
+        self._active = True
+
+    def run(self):
+        while self._active:
+            try:
+                path, row = self.queue.get(timeout=10)
+            except Empty:
+                continue
+            self.procStarted.emit(row)
+            run_main(path)
+            self.procStopped.emit(row)

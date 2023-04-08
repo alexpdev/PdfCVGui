@@ -6,7 +6,7 @@ import xxhash
 from PySide6.QtWidgets import *
 from PySide6.QtCore import *
 from PySide6.QtGui import *
-from PdfCVGui.img import extract_tables, extract_cells
+from PdfCVGui.img import extract_tables, extract_cells, table_image
 import subprocess
 import tempfile
 import parsel
@@ -421,18 +421,23 @@ class PreProcTab(QWidget):
     def find_image_tables(self):
         item = self.get_selected_item()
         bounding_rects = extract_tables(item.image)
-        nimg = item.image.copy()
-        nimg = cv2.cvtColor(nimg, cv2.COLOR_GRAY2RGB, nimg)
-        for x,y,w,h in bounding_rects:
-            nimg[y - 1 : y + h + 1, x : x + w] = np.array([0,255,0])
-        child = QListWidgetItem()
-        child.setText(item.text() + f"-img_bounding_box")
-        child.image = nimg
-        self.add_image_to_grid(nimg, child)
-        self.list_widget.addItem(child)
+        for i, rect in enumerate(bounding_rects):
+            image = table_image(item.image, rect)
+            child = QListWidgetItem()
+            child.setText(item.text() + f"-extracted_table{i}")
+            child.image = image
+            self.add_image_to_grid(image, child)
+            self.list_widget.addItem(child)
 
     def find_cells_dataframes(self):
         item = self.get_selected_item()
 
     def find_image_cells(self):
         item = self.get_selected_item()
+        images = extract_cells(item.image)
+        for i, image in enumerate(images):
+            child = QListWidgetItem()
+            child.setText(item.text() + f"-extract_cells{i}")
+            child.image = image
+            self.add_image_to_grid(image, child)
+            self.list_widget.addItem(child)

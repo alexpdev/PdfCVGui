@@ -696,6 +696,8 @@ class PdfOCR(OCRInstance):
 
     def to_ocr_dataframe(self, content: list) -> OCRDataframe:
         # Check if any page has words
+        if not content:
+            return
         if min(map(len, content)) == 0:
             return None
 
@@ -804,7 +806,7 @@ class TesseractOCR(OCRInstance):
                 )
                 list_elements.append(d_el)
             list_dfs.append(pd.DataFrame(list_elements))
-        return OCRDataframe(df=pd.concat(list_dfs))
+        return OCRDataframe(df=pd.concat(list_dfs)) if list_dfs else None
 
 
 @dataclass
@@ -1017,12 +1019,12 @@ def detect_lines(
     theta: float = np.pi / 180,
     threshold: int = 50,
     minLinLength: int = 150,
-    maxLineGap: int = 15,
+    maxLineGap: int = 20,
     kernel_size: int = 10,
     ocr_df: OCRDataframe = None,
 ):
     img = image.copy()
-    _, img = cv2.threshold(img, 200, 255, cv2.THRESH_TOZERO)
+    _, img = cv2.threshold(img, 215, 255, cv2.THRESH_TOZERO)
     blur = cv2.GaussianBlur(img, (3, 3), 0)
     thresh = cv2.adaptiveThreshold(
         blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 10
@@ -1792,3 +1794,72 @@ def get_title_tables(
             final_tables.append(table)
 
     return final_tables
+
+
+def cluster_to_table(cluster_cells) -> Table:
+    """
+    Convert a cell cluster to a Table object
+    :param cluster_cells: list of cells that form a table
+    :return: table with rows inferred from table cells
+    """
+    # Get list of vertical delimiters
+    v_delims = sorted(list(set([y_val for cell in cluster_cells for y_val in [cell.y1, cell.y2]])))
+
+    # Get list of horizontal delimiters
+    h_delims = sorted(list(set([x_val for cell in cluster_cells for x_val in [cell.x1, cell.x2]])))
+
+    # Create rows and cells
+    list_rows = list()
+    for y_top, y_bottom in zip(v_delims, v_delims[1:]):
+        list_cells = list()
+        for x_left, x_right in zip(h_delims, h_delims[1:]):
+            # Create default cell
+            default_cell = Cell(x1=x_left, y1=y_top, x2=x_right, y2=y_bottom)
+
+            # Check cells that contain the default cell
+            containing_cells = sorted([c for c in cluster_cells
+                                       if is_contained_cell(inner_cell=default_cell, outer_cell=c, percentage=0.9)],
+                                      key=lambda c: c.area)
+
+            # Append either a cell that contain the default cell, or the default cell itself
+            list_cells.append(containing_cells.pop(0) if containing_cells else default_cell)
+
+        list_rows.append(Row(cells=list_cells))
+
+    return Table(rows=list_rows)
+
+
+def normalize_table_cells(cluster_cells):
+    """
+    Normalize cells from table cells
+    :param cluster_cells: list of cells that form a table
+    :return: list of normalized cells
+    """
+    # Compute table shape
+    width = max(map(lambda c: c.x2, cluster_cells)) - min(map(lambda c: c.x1, cluster_cells))
+    height = max(map(lambda c: c.y2, cluster_cells)) - min(map(lambda c: c.y1, cluster_cells))
+
+    # Get list of existing horizontal values
+    h_values = sorted(list(set([x_val for cell in cluster_cells for x_val in [cell.x1, cell.x2]])))
+    # Compute delimiters by grouping close values together
+    h_delims = [round(np.mean(h_group)) for h_group in
+                np.split(h_values, np.where(np.diff(h_values) >= min(width * 0.02, 10))[0] + 1)]
+
+    # Get list of existing vertical values
+    v_values = sorted(list(set([y_val for cell in cluster_cells for y_val in [cell.y1, cell.y2]])))
+    # Compute delimiters by grouping close values together
+    v_delims = [round(np.mean(v_group)) for v_group in
+                np.split(v_values, np.where(np.diff(v_values) >= min(height * 0.02, 10))[0] + 1)]
+
+    # Normalize all cells
+    normalized_cells = list()
+    for cell in cluster_cells:
+        normalized_cell = Cell(x1=sorted(h_delims, key=lambda d: abs(d - cell.x1)).pop(0),
+                               x2=sorted(h_delims, key=lambda d: abs(d - cell.x2)).pop(0),
+                               y1=sorted(v_delims, key=lambda d: abs(d - cell.y1)).pop(0),
+                               y2=sorted(v_delims, key=lambda d: abs(d - cell.y2)).pop(0))
+        # Check if cell is not empty
+        if cell.area > 0:
+            normalized_cells.append(normalized_cell)
+
+    return normalized_cells

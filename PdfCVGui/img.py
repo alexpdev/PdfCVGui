@@ -1,6 +1,7 @@
 import os
 import cv2
 
+
 def extract_cells(image):
     blurred = cv2.GaussianBlur(image, (17,17), 0, 0)
     img_bin = cv2.adaptiveThreshold(

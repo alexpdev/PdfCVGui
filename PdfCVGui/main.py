@@ -5,19 +5,23 @@ import docx
 import fitz
 from docx.enum.section import WD_ORIENT
 from docx.enum.table import WD_ROW_HEIGHT_RULE, WD_TABLE_ALIGNMENT
+from docx.enum.style import WD_STYLE_TYPE
 from docx.shared import Pt
 from PdfCVGui.img import get_table_images, get_cell_images
-from PdfCVGui.ocr import Image, TesseractOCR
+from PdfCVGui.ocr import Image, TesseractOCR, PDF
 import itertools
+import shutil
 
 if "MEI" not in str(Path(__file__).parent):
     PDFS = Path(__file__).parent.parent / "pdfs"
     DATA = Path(__file__).parent.parent.parent / "data"
-    RESULTS = Path(__file__).parent.parent / "results"
+    RESULTS1 = Path(__file__).parent.parent / "results1"
+    RESULTS2 = Path(__file__).parent.parent / "results2"
     TEMP = Path(__file__).parent.parent / "temp"
 else:
     PDFS = Path(sys.executable).parent / "pdfs"
-    RESULTS = Path(sys.executable).parent / "results"
+    RESULTS1 = Path(sys.executable).parent / "results1"
+    RESULTS2 = Path(sys.executable).parent / "results2"
     TEMP = Path(sys.executable).parent / "temp"
 
 def main():
@@ -27,22 +31,25 @@ def main():
         name = pdf.name
         if pdf.suffix != ".pdf":
             continue
-        if not os.path.exists(RESULTS):
-            os.mkdir(RESULTS)
+        if not os.path.exists(RESULTS1):
+            os.mkdir(RESULTS1)
+        if not os.path.exists(RESULTS2):
+            os.mkdir(RESULTS2)
         images = get_images_from_pdf(pdf)
         results = get_table_images(images)
-        for result in results:
-            r = get_cell_images(result)
-        convert_to_docx(results, name)
-    # shutil.rmtree(TEMP)
+        convert_imgs_to_docx(results, name)
+    shutil.rmtree(TEMP)
     return True
 
 def run_main(filepath):
+    if not os.path.exists(RESULTS1):
+        os.mkdir(RESULTS1)
+    if not os.path.exists(RESULTS2):
+        os.mkdir(RESULTS2)
+    convert_pdf_to_docx(filepath, os.path.basename(filepath))
     images = get_images_from_pdf(filepath)
     results = get_table_images(images)
-    for result in results:
-        r = get_cell_images(result)
-    convert_to_docx(results, os.path.basename(filepath))
+    convert_imgs_to_docx(results, os.path.basename(filepath))
 
 def get_images_from_pdf(path):
     name = path.name
@@ -58,16 +65,32 @@ def get_images_from_pdf(path):
         lst.append(str(filename))
     return lst
 
-def convert_to_docx(results, name):
+def convert_pdf_to_docx(path, name):
+    ocr = TesseractOCR(3, "eng")
+    pdf = PDF(str(path))
+    tables = pdf.extract_tables(ocr=ocr, implicit_rows=True)
+    doc = docx.Document()
+    for section in doc.sections:
+        section.orientation = WD_ORIENT.LANDSCAPE
+        section.page_height, section.page_width = section.page_width, section.page_height + 4
+    for idx, tables in tables.items():
+        for table in tables:
+            add_table(doc, table)
+    doc.save(str(RESULTS2 / (name + ".docx")))
+
+def convert_imgs_to_docx(results, name):
     ocr = TesseractOCR(3, "eng")
     doc = docx.Document()
+    for section in doc.sections:
+        section.orientation = WD_ORIENT.LANDSCAPE
+        section.page_height, section.page_width = section.page_width, section.page_height + 4
     for imgs in results:
         for i in imgs:
             image = Image(i)
             tables = image.extract_tables(ocr=ocr)
             for table in tables:
                 add_table(doc, table)
-    doc.save(str(RESULTS / (name + ".docx")))
+    doc.save(str(RESULTS1 / (name + ".docx")))
 
 def add_table(doc, table):
     data = {}
@@ -82,7 +105,7 @@ def add_table(doc, table):
             data[hash(col)] += [(col, r, c)]
     tab = doc.add_table(cols=maxc+1, rows=maxr+ 1)
     tab.style = "Table Grid"
-    tab.alignment = WD_TABLE_ALIGNMENT.LEFT
+    tab.alignment = WD_TABLE_ALIGNMENT.CENTER
     tab.autofit = True
     for row in tab.rows:
         row.height_rule = WD_ROW_HEIGHT_RULE.AT_LEAST
@@ -93,6 +116,7 @@ def add_table(doc, table):
             if pos[0].value is not None:
                 tab.cell(pos[1], pos[2]).text = pos[0].value
         else:
+            cell1 = None
             for c1, c2 in itertools.pairwise(c):
                 if [c2[1], c2[2]] in gen_neighbors(c1):
                     row1 = tab.rows[c1[1]]
@@ -103,7 +127,7 @@ def add_table(doc, table):
                         cell1.merge(cell2)
                     except:
                         pass
-            if c1[0].value is not None:
+            if c1[0].value is not None and cell1 is not None:
                 cell1.text = c1[0].value
     p = doc.add_paragraph()
     p.add_run("")

@@ -37,4 +37,7 @@ def execute():
     app.setStyleSheet(template_style)
     window = Window()
     window.show()
-    app.exec()
+    try:
+        app.exec()
+    except Exception as e:
+        print(e)
