@@ -3,14 +3,16 @@ import io
 import math
 import os
 import re
+import operator
 import statistics
 import subprocess
-from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from pathlib import Path
+from queue import PriorityQueue
+from dataclasses import dataclass
+from collections import OrderedDict
 from tempfile import NamedTemporaryFile
 from typing import NamedTuple, OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import fitz
@@ -25,14 +27,12 @@ class Validations:
             method = getattr(self, f"validate_{name}", None)
             setattr(self, name, method(getattr(self, name), field=field))
 
-
 @dataclass
 class BBox:
     x1: int
     y1: int
     x2: int
     y2: int
-
 
 @dataclass
 class TableCell:
@@ -67,7 +67,6 @@ class TableObject:
                 self.x2 + width_margin,
                 self.y2 + height_margin,
             )
-
         return bbox
 
     @property
@@ -77,6 +76,10 @@ class TableObject:
     @property
     def width(self) -> int:
         return self.x2 - self.x1
+
+    @property
+    def area(self) -> int:
+        return self.height * self.width
 
 
 @dataclass
@@ -143,15 +146,11 @@ class Row(TableObject):
             self._items += [cells]
         else:
             self._items += cells
-
         return self
 
     def split_in_rows(self, vertical_delimiters: list) -> list:
-        # Create list of tuples for vertical boundaries
         row_delimiters = [self.y1] + vertical_delimiters + [self.y2]
         row_boundaries = [(i, j) for i, j in zip(row_delimiters, row_delimiters[1:])]
-
-        # Create new list of rows
         l_new_rows = list()
         for boundary in row_boundaries:
             cells = list()
@@ -160,7 +159,6 @@ class Row(TableObject):
                 _cell.y1, _cell.y2 = boundary
                 cells.append(_cell)
             l_new_rows.append(Row(cells=cells))
-
         return l_new_rows
 
     def __eq__(self, other) -> bool:
@@ -179,12 +177,12 @@ class Line(TableObject):
     y1: int
     x2: int
     y2: int
+    thickness: int = None
 
     @property
     def angle(self) -> float:
         delta_x = self.x2 - self.x1
         delta_y = self.y2 - self.y1
-
         return math.atan2(delta_y, delta_x) * 180 / np.pi
 
     @property
@@ -212,17 +210,14 @@ class Line(TableObject):
 
     @property
     def transpose(self) -> "Line":
-        return Line(x1=self.y1, y1=self.x1, x2=self.y2, y2=self.x2)
+        return Line(x1=self.y1, y1=self.x1, x2=self.y2, y2=self.x2, thickness=self.thickness)
 
     def reprocess(self):
-        # Reallocate coordinates in proper order
         _x1 = min(self.x1, self.x2)
         _x2 = max(self.x1, self.x2)
         _y1 = min(self.y1, self.y2)
         _y2 = max(self.y1, self.y2)
         self.x1, self.x2, self.y1, self.y2 = _x1, _x2, _y1, _y2
-
-        # Correct "almost" horizontal or vertical lines
         if abs(self.angle) <= 5:
             y_val = round((self.y1 + self.y2) / 2)
             self.y2 = self.y1 = y_val
@@ -250,7 +245,6 @@ class ExtractedTable:
             for id_col, cell in enumerate(row):
                 cell_pos = CellPosition(cell=cell, row=id_row, col=id_col)
                 dict_cells[hash(cell)] = dict_cells.get(hash(cell), []) + [cell_pos]
-
         for c in dict_cells.values():
             if len(c) == 1:
                 cell_pos = c.pop()
@@ -262,8 +256,7 @@ class ExtractedTable:
                 last_row=max(map(lambda x: x.row, c)),
                 last_col=max(map(lambda x: x.col, c)),
                 data=c[0].cell.value,
-                cell_format=cell_fmt,
-                )
+                cell_format=cell_fmt)
         sheet.autofit()
 
     def html_repr(self, title: str = None) -> str:
@@ -329,6 +322,39 @@ class Table(TableObject):
     def y2(self) -> int:
         return max(map(lambda x: x.y2, self.items))
 
+    @property
+    def cell(self) -> Cell:
+        return Cell(x1=self.x1, y1=self.y1, x2=self.x2, y2=self.y2)
+
+    def remove_rows(self, row_ids: list):
+        remaining_rows = [idx for idx in range(self.nb_rows) if idx not in row_ids]
+        if len(remaining_rows) > 1:
+            gaps = [(id_row, id_next) for id_row, id_next in zip(remaining_rows, remaining_rows[1:])
+                    if id_next - id_row > 1]
+            for id_row, id_next in gaps:
+                y_gap = round((self.items[id_row].y2 + self.items[id_next].y1) / 2)
+                for c in self.items[id_row].items:
+                    setattr(c, "y2", y_gap)
+                for c in self.items[id_next].items:
+                    setattr(c, "y1", y_gap)
+        for idx in reversed(row_ids):
+            self.items.pop(idx)
+
+    def remove_columns(self, col_ids: list):
+        remaining_cols = [idx for idx in range(self.nb_columns) if idx not in col_ids]
+        if len(remaining_cols) > 1:
+            gaps = [(id_col, id_next) for id_col, id_next in zip(remaining_cols, remaining_cols[1:])
+                    if id_next - id_col > 1]
+            for id_col, id_next in gaps:
+                x_gap = round(np.mean([row.items[id_col].x2 + row.items[id_next].x1 for row in self.items]) / 2)
+                for row in self.items:
+                    setattr(row.items[id_col], "x2", x_gap)
+                    setattr(row.items[id_next], "x1", x_gap)
+        for idx in reversed(col_ids):
+            for id_row in range(self.nb_rows):
+                self.items[id_row].items.pop(idx)
+
+
     def get_content(self, ocr_df: "OCRDataframe", min_confidence: int = 50) -> "Table":
         self = ocr_df.get_text_table(table=self, min_confidence=min_confidence)
         empty_rows = list()
@@ -348,7 +374,6 @@ class Table(TableObject):
         unique_cells = set([cell for row in self.items for cell in row.items])
         if len(unique_cells) == 1:
             self._items = [Row(cells=self.items[0].items[0])]
-
         return self
 
     @property
@@ -380,6 +405,36 @@ class OCRDataframe:
     def page(self, page_number: int = 0) -> "OCRDataframe":
         return OCRDataframe(df=self.df[self.df["page"] == page_number])
 
+    @property
+    def median_line_sep(self):
+        df_words = self.df[self.df['class'] == 'ocrx_word']
+        if df_words.shape[0] <= 1:
+            return None
+        df_right = pd.DataFrame({i + "_right": df_words[i] for i in df_words.columns})
+        df_words["key"] = 1
+        df_right["key"] = 1
+        df_h_words = pd.merge(df_words, df_right, on="key").drop("key", axis=1)
+        df_h_words = df_h_words[df_h_words['id'] != df_h_words['id_right']]
+        df_h_words = df_h_words[df_h_words[['x2', 'x2_right']].min(axis=1) - df_h_words[['x1', 'x1_right']].max(axis=1) > 0]
+        df_words_below = df_h_words[df_h_words['y1'] < df_h_words['y1_right']]
+        df_words_below = df_words_below.sort_values(['id', 'y1_right'])
+        df_words_below['ones'] = 1
+        df_words_below['rk'] = df_words_below.groupby(df_words_below['id'])['ones'].cumsum()
+        df_words_below = df_words_below[df_words_below['rk'] == 1]
+        median_v_dist = ((df_words_below['y1_right'] + df_words_below['y2_right'] - df_words_below['y1'] - df_words_below['y2']) / 2).median()
+        return median_v_dist
+
+    @property
+    def char_length(self) -> float:
+        try:
+            df_text_size = self.df[self.df['value'].notnull()]
+            df_text_size['str_length'] = df_text_size['value'].str.len()
+            df_text_size['width'] = df_text_size['x2'] - df_text_size['x1']
+            char_length = df_text_size['width'].sum() / df_text_size['str_length'].sum()
+            return char_length
+        except Exception:
+            return None
+
     def get_text_cell(
         self,
         cell: Cell,
@@ -388,17 +443,12 @@ class OCRDataframe:
         min_confidence: int = 50,
     ) -> str:
         bbox = cell.bbox(margin=margin)
-
-        # Filter dataframe on relevant page
         df_words = self.df[(self.df["class"] == "ocrx_word")]
         if page_number:
             df_words = df_words[df_words["page"] == page_number]
-        # Filter dataframe on relevant words
         df_words = df_words[
             df_words["value"].notnull() & (df_words["confidence"] >= min_confidence)
         ]
-
-        # Compute coordinates of intersection
         df_words = df_words.assign(
             **{
                 "x1_bbox": bbox[0],
@@ -411,23 +461,15 @@ class OCRDataframe:
         df_words["y_top"] = df_words[["y1", "y1_bbox"]].max(axis=1)
         df_words["x_right"] = df_words[["x2", "x2_bbox"]].min(axis=1)
         df_words["y_bottom"] = df_words[["y2", "y2_bbox"]].min(axis=1)
-
-        # Filter where intersection is not empty
         df_words = df_words[df_words["x_right"] > df_words["x_left"]]
         df_words = df_words[df_words["y_bottom"] > df_words["y_top"]]
-
-        # Compute area of word bbox and intersection
         df_words["w_area"] = (df_words["x2"] - df_words["x1"]) * (
             df_words["y2"] - df_words["y1"]
         )
         df_words["int_area"] = (df_words["x_right"] - df_words["x_left"]) * (
             df_words["y_bottom"] - df_words["y_top"]
         )
-
-        # Filter on words where its bbox is contained in area
         df_words_contained = df_words[df_words["int_area"] / df_words["w_area"] >= 0.75]
-
-        # Group text by parents
         df_text_parent = (
             df_words_contained.groupby("parent")
             .agg(
@@ -439,8 +481,6 @@ class OCRDataframe:
             )
             .sort_values(by=["y1", "x1"])
         )
-
-        # Concatenate all lines
         return df_text_parent["value"].astype(str).str.cat(sep="\n").strip() or None
 
     def get_text_table(
@@ -449,12 +489,9 @@ class OCRDataframe:
         df_words = self.df[(self.df["class"] == "ocrx_word")]
         if page_number:
             df_words = df_words[df_words["page"] == page_number]
-        # Filter dataframe on relevant words
         df_words = df_words[
             df_words["value"].notnull() & (df_words["confidence"] >= min_confidence)
         ]
-
-        # Create dataframe containing all coordinates of Cell objects
         list_cells = [
             {
                 "row": id_row,
@@ -468,42 +505,28 @@ class OCRDataframe:
             for id_col, cell in enumerate(row.items)
         ]
         df_cells = pd.DataFrame(list_cells)
-
-        # Cartesian product between two dataframes
         df_word_cells = df_words.merge(df_cells, how="cross")
-
-        # Compute coordinates of intersection
         df_word_cells["x_left"] = df_word_cells[["x1", "x1_w"]].max(axis=1)
         df_word_cells["y_top"] = df_word_cells[["y1", "y1_w"]].max(axis=1)
         df_word_cells["x_right"] = df_word_cells[["x2", "x2_w"]].min(axis=1)
         df_word_cells["y_bottom"] = df_word_cells[["y2", "y2_w"]].min(axis=1)
-
-        # Filter where intersection is not empty
         df_word_cells = df_word_cells[
             df_word_cells["x_right"] > df_word_cells["x_left"]
         ]
         df_word_cells = df_word_cells[
             df_word_cells["y_bottom"] > df_word_cells["y_top"]
         ]
-
-        # Compute area of word bbox and intersection
         df_word_cells["w_area"] = (df_word_cells["x2"] - df_word_cells["x1"]) * (
             df_word_cells["y2"] - df_word_cells["y1"]
         )
         df_word_cells["int_area"] = (
             df_word_cells["x_right"] - df_word_cells["x_left"]
         ) * (df_word_cells["y_bottom"] - df_word_cells["y_top"])
-
-        # Filter on words where its bbox is contained in area
         df_words_contained = df_word_cells[
             df_word_cells["int_area"] / df_word_cells["w_area"] >= 0.75
         ]
-
-        # If no words are contained, return the table
         if len(df_words_contained) == 0:
             return table
-
-        # Group text by parent
         df_text_parent = (
             df_words_contained.groupby(["row", "col", "parent"])
             .agg(
@@ -518,8 +541,6 @@ class OCRDataframe:
             .agg(text=("value", lambda x: "\n".join(x) or None))
             .reset_index()
         )
-
-        # Implement found values to table cells content
         for rec in df_text_parent.to_dict(orient="records"):
             table.items[rec.get("row")].items[rec.get("col")].content = (
                 rec.get("text").strip() or None
@@ -553,9 +574,7 @@ class Document(Validations):
 
     def __post_init__(self):
         super(Document, self).__post_init__()
-        # Initialize ocr_df
         self.ocr_df = None
-
         if isinstance(self.pages, list):
             self.pages = sorted(self.pages)
 
@@ -578,29 +597,23 @@ class Document(Validations):
         self,
         ocr: "OCRInstance" = None,
         implicit_rows: bool = True,
+        borderless_tables: bool = False,
         min_confidence: int = 50,
     ) -> dict:
         if self.ocr_df is None and ocr is not None:
             self.ocr_df = ocr.of(document=self)
-
-        # Extract tables from document
         tables = {
             idx: TableImage(
                 img=img,
                 dpi=self.dpi,
                 ocr_df=self.ocr_df.page(page_number=idx) if self.ocr_df else None,
                 min_confidence=min_confidence,
-            ).extract_tables(implicit_rows=implicit_rows)
+            ).extract_tables(implicit_rows=implicit_rows, borderless_tables=borderless_tables)
             for idx, img in enumerate(self.images)
         }
-
-        # If pages have been defined, modify tables keys
         if self.pages:
             tables = {self.pages[k]: v for k, v in tables.items()}
-
-        # Reset ocr_df attribute
         self.ocr_df = None
-
         return tables
 
     def to_xlsx(
@@ -618,29 +631,16 @@ class Document(Validations):
             if isinstance(extracted_tables, list)
             else extracted_tables
         )
-
-        # Create workbook
         workbook = xlsxwriter.Workbook(dest, {"in_memory": True})
-
-        # Create generic cell format
         cell_format = workbook.add_format({"align": "center", "valign": "vcenter"})
         cell_format.set_border()
-
-        # For each extracted table, create a corresponding worksheet and populate it
         for page, tables in extracted_tables.items():
             for idx, table in enumerate(tables):
-                # Create worksheet
                 sheet = workbook.add_worksheet(
                     name=f"Page {page + 1} - Table {idx + 1}"
                 )
-
-                # Populate worksheet
                 table._to_worksheet(sheet=sheet, cell_fmt=cell_format)
-
-        # Close workbook
         workbook.close()
-
-        # If destination is a BytesIO object, return it
         if isinstance(dest, io.BytesIO):
             dest.seek(0)
             return dest
@@ -664,14 +664,9 @@ class PdfOCR(OCRInstance):
 
         doc = fitz.Document(stream=document.bytes, filetype="pdf")
         for idx, page_number in enumerate(document.pages or range(doc.page_count)):
-            # Get page
             page = doc.load_page(page_id=page_number)
-
-            # Get image size and page dimensions
             img_height, img_width = list(document.images)[idx].shape[:2]
             page_height, page_width = page.mediabox.height, page.mediabox.width
-
-            # Extract words
             list_words = list()
             for word in page.get_text("words", sort=True):
                 x1, y1, x2, y2, value, block_no, line_no, word_no = word
@@ -688,22 +683,15 @@ class PdfOCR(OCRInstance):
                     "y2": round(y2 * img_height / page_height),
                 }
                 list_words.append(dict_word)
-
-            # Append to list of pages
             list_pages.append(list_words)
-
         return list_pages
 
     def to_ocr_dataframe(self, content: list) -> OCRDataframe:
-        # Check if any page has words
         if not content:
             return
         if min(map(len, content)) == 0:
             return None
-
-        # Create OCRDataframe
         content_df = pd.concat(map(pd.DataFrame, content))
-
         return OCRDataframe(df=content_df)
 
 
@@ -736,10 +724,11 @@ class PDF(Document):
         ocr: "OCRInstance" = None,
         implicit_rows: bool = True,
         min_confidence: int = 50,
+        borderless_tables: bool = False
     ) -> dict:
         self.ocr_df = PdfOCR().of(document=self)
         return super().extract_tables(
-            ocr=ocr, implicit_rows=implicit_rows, min_confidence=min_confidence
+            ocr=ocr, implicit_rows=implicit_rows, borderless_tables=borderless_tables, min_confidence=min_confidence
         )
 
 
@@ -749,7 +738,6 @@ class TesseractOCR(OCRInstance):
             self.n_threads = n_threads
         else:
             raise TypeError(f"Invalid type {type(n_threads)} for n_threads argument")
-
         if isinstance(lang, str):
             self.lang = lang
         else:
@@ -773,12 +761,10 @@ class TesseractOCR(OCRInstance):
     def content(self, document: Document) -> str:
         with ThreadPoolExecutor(max_workers=self.n_threads) as pool:
             hocrs = pool.map(self.hocr, document.images)
-
         return hocrs
 
     def to_ocr_dataframe(self, content: list) -> OCRDataframe:
         list_dfs = list()
-
         for page, hocr in enumerate(content):
             soup = BeautifulSoup(hocr, features="html.parser")
             list_elements = list()
@@ -818,67 +804,59 @@ class TableImage:
     lines: list = None
     tables: list = None
 
+    def __post_init__(self):
+        self.img = prepare_image(img=self.img)
+
     @property
     def white_img(self) -> np.ndarray:
         white_img = copy.deepcopy(self.img)
-
-        # Draw white lines on detected lines
         for line in self.lines:
             cv2.rectangle(
                 white_img, (line.x1, line.y1), (line.x2, line.y2), (255, 255, 255), 3
             )
-
         return white_img
 
-    def extract_tables(self, implicit_rows: bool = True) -> list:
-        # Detect lines in image
+    def extract_tables(self, implicit_rows: bool = True, borderless_tables: bool = False) -> list:
+        if self.ocr_df is not None:
+            minLinLength = maxLineGap = round(0.33 * self.ocr_df.median_line_sep) if self.ocr_df.median_line_sep is not None else self.dpi // 20
+            kernel_size = round(0.66 * self.ocr_df.median_line_sep) if self.ocr_df.median_line_sep is not None else self.dpi // 10
+        else:
+            minLinLength = maxLineGap = self.dpi // 20
+            kernel_size = self.dpi // 10
         try:
             h_lines, v_lines = detect_lines(
                 image=self.img,
                 rho=0.3,
                 theta=np.pi / 180,
                 threshold=10,
-                minLinLength=self.dpi // 20,
-                maxLineGap=self.dpi // 20,
-                kernel_size=self.dpi // 10,
+                minLinLength=minLinLength,
+                maxLineGap=maxLineGap,
+                kernel_size=kernel_size,
                 ocr_df=self.ocr_df,
             )
         except:
             return []
         self.lines = h_lines + v_lines
-
-        # Create cells from lines
         cells = get_cells(horizontal_lines=h_lines, vertical_lines=v_lines)
-
-        # Create tables from lines
         self.tables = get_tables(cells=cells)
-
-        # If necessary, detect implicit rows
         if implicit_rows:
             self.tables = handle_implicit_rows(
                 img=self.white_img, tables=self.tables, ocr_df=self.ocr_df
             )
-
-        # If ocr_df is available, get titles and tables content
         if self.ocr_df is not None:
-            # Get title
-            self.tables = get_title_tables(
-                img=self.img, tables=self.tables, ocr_df=self.ocr_df
-            )
-
-            # Get content
-            self.tables = [
-                table.get_content(
-                    ocr_df=self.ocr_df, min_confidence=self.min_confidence
-                )
-                for table in self.tables
-            ]
-
-        return [
-            table.extracted_table
-            for table in self.tables
-            if table.nb_columns * table.nb_rows > 1
-        ]
+            self.tables = [table.get_content(ocr_df=self.ocr_df, min_confidence=self.min_confidence)
+                           for table in self.tables]
+            self.tables = [table for table in self.tables if table.nb_rows * table.nb_columns > 1]
+            if borderless_tables:
+                borderless_tbs = identify_borderless_tables(img=self.img,
+                                                            ocr_df=self.ocr_df,
+                                                            lines=self.lines,
+                                                            existing_tables=self.tables)
+                borderless_tbs = [table.get_content(ocr_df=self.ocr_df, min_confidence=self.min_confidence)
+                                  for table in borderless_tbs]
+                self.tables += [tb for tb in borderless_tbs if min(tb.nb_rows, tb.nb_columns) >= 2]
+            self.tables = get_title_tables(img=self.img, tables=self.tables, ocr_df=self.ocr_df)
+        return [table.extracted_table for table in self.tables]
 
 
 @dataclass
@@ -892,7 +870,6 @@ class Image(Document):
 
     def __post_init__(self):
         self.pages = None
-
         super(Image, self).__post_init__()
 
     @property
@@ -910,6 +887,167 @@ class Image(Document):
             ocr=ocr, implicit_rows=implicit_rows, min_confidence=min_confidence
         )
         return extracted_tables.get(0)
+
+@dataclass
+class TableLine:
+    cells: list
+
+    @property
+    def x1(self) -> int:
+        return min([c.x1 for c in self.cells])
+
+    @property
+    def y1(self) -> int:
+        return min([c.y1 for c in self.cells])
+
+    @property
+    def x2(self) -> int:
+        return max([c.x2 for c in self.cells])
+
+    @property
+    def y2(self) -> int:
+        return max([c.y2 for c in self.cells])
+
+    @property
+    def v_center(self) -> float:
+        return (self.y1 + self.y2) / 2
+
+    @property
+    def height(self) -> int:
+        return self.y2 - self.y1
+
+    @property
+    def size(self) -> int:
+        return len(self.cells)
+
+    @property
+    def cell(self) -> Cell:
+        return Cell(x1=self.x1, y1=self.y1, x2=self.x2, y2=self.y2)
+
+    def add(self, c: Cell):
+        self.cells.append(c)
+
+    def overlaps(self, other: "TableLine") -> bool:
+        y_top = max(self.y1, other.y1)
+        y_bottom = min(self.y2, other.y2)
+        return (y_bottom - y_top) / min(self.height, other.height) >= 0.5
+
+    def merge(self, other: "TableLine") -> "TableLine":
+        return TableLine(cells=self.cells + other.cells)
+
+    def __eq__(self, other):
+        return self.cells == other.cells
+
+    def __hash__(self):
+        return hash(f"{self.x1},{self.y1},{self.x2},{self.y2}")
+
+
+@dataclass
+class LineGroup:
+    lines: list
+
+    @property
+    def x1(self) -> int:
+        return min([c.x1 for c in self.lines])
+
+    @property
+    def y1(self) -> int:
+        return min([c.y1 for c in self.lines])
+
+    @property
+    def x2(self) -> int:
+        return max([c.x2 for c in self.lines])
+
+    @property
+    def y2(self) -> int:
+        return max([c.y2 for c in self.lines])
+
+    @property
+    def height(self) -> int:
+        return self.y2 - self.y1
+
+    @property
+    def size(self) -> int:
+        return len(self.lines)
+
+    @property
+    def median_line_sep(self) -> float:
+        if len(self.lines) <= 1:
+            return 0
+        sorted_lines = sorted(self.lines, key=lambda line: line.y1 + line.y2)
+        return np.median([nxt.v_center - prev.v_center for prev, nxt in zip(sorted_lines, sorted_lines[1:])])
+
+    @property
+    def median_line_gap(self) -> float:
+        if len(self.lines) <= 1:
+            return 0
+        sorted_lines = sorted(self.lines, key=lambda line: line.y1 + line.y2)
+        return np.median([nxt.y1 - prev.y2 for prev, nxt in zip(sorted_lines, sorted_lines[1:])])
+
+    def add(self, line: TableLine):
+        self.lines.append(line)
+
+    def __hash__(self):
+        return hash(repr(self))
+
+
+@dataclass
+class ImageSegment:
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    elements: list = None
+    line_groups: list  = None
+
+    def set_elements(self, elements):
+        self.elements = elements
+
+    def __hash__(self):
+        return hash(repr(self))
+
+
+class Rectangle(NamedTuple):
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+
+    @classmethod
+    def from_cell(cls, cell: Cell) -> "Rectangle":
+        return cls(x1=cell.x1, y1=cell.y1, x2=cell.x2, y2=cell.y2)
+
+    @property
+    def height(self):
+        return self.y2 - self.y1
+
+    @property
+    def width(self):
+        return self.x2 - self.x1
+
+    @property
+    def area(self):
+        return (self.x2 - self.x1) * (self.y2 - self.y1)
+
+    @property
+    def center(self):
+        return (self.x1 + self.x2) / 2, (self.y1 + self.y2) / 2
+
+    @property
+    def cell(self) -> Cell:
+        return Cell(x1=self.x1, y1=self.y1, x2=self.x2, y2=self.y2)
+
+    def distance(self, other):
+        return (self.center[0] - other.center[0]) ** 2 + (self.center[1] - other.center[1]) ** 2
+
+    def overlaps(self, other):
+        x_left = max(self.x1, other.x1)
+        y_top = max(self.y1, other.y1)
+        x_right = min(self.x2, other.x2)
+        y_bottom = min(self.y2, other.y2)
+        if x_right < x_left or y_bottom < y_top:
+            return False
+        return (x_right - x_left) * (y_bottom - y_top) > 0
 
 
 def overlapping_filter(lines: list, max_gap: int = 5) -> list:
@@ -936,7 +1074,6 @@ def overlapping_filter(lines: list, max_gap: int = 5) -> list:
                 sub_clusters[-1].append(line)
             else:
                 sub_clusters.append([line])
-
         for sub_cl in sub_clusters:
             y_value = round(
                 np.average(
@@ -944,25 +1081,24 @@ def overlapping_filter(lines: list, max_gap: int = 5) -> list:
                     weights=list(map(lambda l: l.length, sub_cl)),
                 )
             )
+            thickness = min(max(1, max(map(lambda l: l.y2, sub_cl)) - min(map(lambda l: l.y1, sub_cl))), 5)
             line = Line(
                 x1=min(map(lambda l: l.x1, sub_cl)),
                 x2=max(map(lambda l: l.x2, sub_cl)),
                 y1=y_value,
                 y2=y_value,
+                thickness=thickness
             )
-
             if line.length > 0:
                 final_lines.append(line)
     if not horizontal:
         final_lines = [line.transpose for line in final_lines]
-
     return final_lines
 
 
 def remove_word_lines(lines: list, ocr_df: OCRDataframe) -> list:
     if len(lines) == 0:
         return lines
-
     df_words = ocr_df.df[ocr_df.df["class"] == "ocrx_word"]
     df_words = df_words[(df_words["confidence"] >= 50) | df_words["confidence"].isna()]
     df_lines = pd.DataFrame(data=[line.dict for line in lines])
@@ -1009,7 +1145,6 @@ def remove_word_lines(lines: list, ocr_df: OCRDataframe) -> list:
     intersecting_lines = df_inter[df_inter["intersection"] / df_inter["length"] > 0.5][
         "line_id"
     ].values.tolist()
-
     return [line for idx, line in enumerate(lines) if idx not in intersecting_lines]
 
 
@@ -1024,29 +1159,39 @@ def detect_lines(
     ocr_df: OCRDataframe = None,
 ):
     img = image.copy()
-    _, img = cv2.threshold(img, 215, 255, cv2.THRESH_TOZERO)
-    blur = cv2.GaussianBlur(img, (3, 3), 0)
-    thresh = cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 10
-    )
-    for kernel_tup, gap in [
-        ((kernel_size, 1), 2 * maxLineGap),
-        ((1, kernel_size), maxLineGap),
-    ]:
+    thresh = threshold_dark_areas(img=img, ocr_df=ocr_df)
+    for kernel_tup, gap in [((kernel_size, 1), 2 * maxLineGap), ((1, kernel_size), maxLineGap)]:
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, kernel_tup)
         mask = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-        hough_lines = cv2.HoughLinesP(
-            mask, rho, theta, threshold, None, minLinLength, maxLineGap
-        )
+        hough_lines = cv2.HoughLinesP(mask, rho, theta, threshold, None, minLinLength, maxLineGap)
         if hough_lines is None:
+            yield []
             continue
         lines = [Line(*line[0].tolist()).reprocess() for line in hough_lines]
         lines = [line for line in lines if line.horizontal or line.vertical]
         merged_lines = overlapping_filter(lines=lines, max_gap=gap)
         if ocr_df is not None:
             merged_lines = remove_word_lines(lines=merged_lines, ocr_df=ocr_df)
-
         yield merged_lines
+
+def threshold_dark_areas(img: np.ndarray, ocr_df: OCRDataframe) -> np.ndarray:
+    blur = cv2.GaussianBlur(img, (3, 3), 0)
+    thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 10)
+    binary_thresh = cv2.adaptiveThreshold(255 - blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 10)
+    try:
+        blur_size = int(2 * ocr_df.char_length) + 1 - int(2 * ocr_df.char_length) % 2 if ocr_df.char_length else 11
+    except Exception as e:
+        blur_size = 11
+    blur = cv2.medianBlur(img, blur_size)
+    mask = cv2.inRange(blur, 0, 100)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        margin = int(ocr_df.char_length) if ocr_df.char_length else 5
+        if min(w, h) > 2 * margin and w * h / np.prod(img.shape[:2]) < 0.9:
+            thresh[y+margin:y+h-margin, x+margin:x+w-margin] = binary_thresh[y+margin:y+h-margin, x+margin:x+w-margin]
+    return thresh
+
 
 def is_contained_cell(
     inner_cell: tuple,
@@ -1061,13 +1206,10 @@ def is_contained_cell(
     y_top = max(inner_cell.y1, outer_cell.y1)
     x_right = min(inner_cell.x2, outer_cell.x2)
     y_bottom = min(inner_cell.y2, outer_cell.y2)
-
     if x_right < x_left or y_bottom < y_top:
         return False
-
     intersection_area = (x_right - x_left) * (y_bottom - y_top)
     inner_cell_area = inner_cell.height * inner_cell.width
-
     return intersection_area / inner_cell_area >= percentage
 
 
@@ -1080,7 +1222,6 @@ def merge_contours(
         sorted_cnt = sorted(
             contours, key=lambda cnt: cnt.height * cnt.width, reverse=True
         )
-
         seq = iter(sorted_cnt)
         list_cnts = [copy.deepcopy(next(seq))]
         for cnt in seq:
@@ -1097,16 +1238,11 @@ def merge_contours(
                 list_cnts[id].y2 = max(list_cnts[id].y2, cnt.y2)
             else:
                 list_cnts.append(copy.deepcopy(cnt))
-
         return list_cnts
-
-    # Define dimensions used to merge contours
     idx_1 = "y1" if vertically else "x1"
     idx_2 = "y2" if vertically else "x2"
     sort_idx_1 = "x1" if vertically else "y1"
     sort_idx_2 = "x2" if vertically else "y2"
-
-    # Sort contours
     sorted_cnts = sorted(
         contours,
         key=lambda cnt: (
@@ -1115,14 +1251,10 @@ def merge_contours(
             getattr(cnt, sort_idx_1),
         ),
     )
-
-    # Loop over contours and merge overlapping contours
     seq = iter(sorted_cnts)
     list_cnts = [copy.deepcopy(next(seq))]
     for cnt in seq:
-        # If contours overlap, update current contour
         if getattr(cnt, idx_1) <= getattr(list_cnts[-1], idx_2):
-            # Update current contour coordinates
             setattr(
                 list_cnts[-1],
                 idx_2,
@@ -1140,7 +1272,6 @@ def merge_contours(
             )
         else:
             list_cnts.append(copy.deepcopy(cnt))
-
     return list_cnts
 
 
@@ -1176,7 +1307,6 @@ def get_contours_cell(
         contour_cell = Cell(x, y, x + w, y + h)
         list_cnts_cell.append(contour_cell)
     contours = merge_contours(contours=list_cnts_cell, vertically=merge_vertically)
-
     return contours
 
 
@@ -1185,7 +1315,6 @@ def normalize_table_cells(cluster_cells: list) -> list:
     r_bound_tb = max(map(lambda c: c.x2, cluster_cells))
     up_bound_tb = min(map(lambda c: c.y1, cluster_cells))
     low_bound_tb = max(map(lambda c: c.y2, cluster_cells))
-
     normalized_cells = list()
     list_y_values = list()
     for cell in sorted(cluster_cells, key=lambda c: (c.y1, c.y2)):
@@ -1211,9 +1340,7 @@ def normalize_table_cells(cluster_cells: list) -> list:
             cell.y2 = close_lower_values.pop()
         else:
             list_y_values.append(cell.y2)
-
         normalized_cells.append(cell)
-
     return normalized_cells
 
 
@@ -1227,7 +1354,6 @@ def create_rows_table(cluster_cells: list) -> Table:
             list_rows[-1].add_cells(cells=cell)
         else:
             list_rows.append(Row(cells=cell))
-
     return Table(rows=list_rows)
 
 
@@ -1266,7 +1392,6 @@ def handle_vertical_merged_cells(row: Row) -> list:
     new_rows = [
         Row(cells=[col[idx] for col in recomputed_columns]) for idx in range(nb_rows)
     ]
-
     return new_rows
 
 
@@ -1303,7 +1428,6 @@ def handle_horizontal_merged_cells(table: Table) -> Table:
                 )
                 _cells.append(closest_cell)
             new_rows.append(Row(cells=_cells))
-
     return Table(rows=new_rows)
 
 
@@ -1315,35 +1439,27 @@ def handle_merged_cells(table: Table) -> Table:
             for _row in handle_vertical_merged_cells(row=row)
         ]
     )
-
     table_h_merged = handle_horizontal_merged_cells(table=table_v_merged)
-
     return table_h_merged
 
 
 def create_word_image(img: np.ndarray, ocr_df: OCRDataframe) -> np.ndarray:
     df_words = ocr_df.df[ocr_df.df["class"] == "ocrx_word"]
-
     words_img = np.zeros(img.shape, dtype=np.uint8)
     words_img.fill(255)
-
     for word in df_words.to_dict(orient="records"):
-        # Get cropped image of word
         cropped_img = img[
             word.get("y1") : word.get("y2"), word.get("x1") : word.get("x2")
         ]
-
         words_img[
             word.get("y1") : word.get("y2"), word.get("x1") : word.get("x2")
         ] = cropped_img
-
     return words_img
 
 
 def handle_implicit_rows_table(img: np.ndarray, table: Table) -> Table:
     if table.nb_columns * table.nb_rows <= 1:
         return table
-
     list_splitted_rows = list()
     for row in table.items:
         if not row.v_consistent:
@@ -1364,7 +1480,6 @@ def handle_implicit_rows_table(img: np.ndarray, table: Table) -> Table:
             ]
         )
         list_splitted_rows += row.split_in_rows(vertical_delimiters=vertical_delimiters)
-
     return Table(rows=list_splitted_rows)
 
 
@@ -1375,7 +1490,6 @@ def handle_implicit_rows(
     tables_implicit_rows = [
         handle_implicit_rows_table(img=words_img, table=table) for table in tables
     ]
-
     return tables_implicit_rows
 
 
@@ -1398,7 +1512,6 @@ def adjacent_cells(cell_1: Cell, cell_2: Cell) -> bool:
     )
     if overlapping_x > 5 and diff_y / max(cell_1.height, cell_2.height) <= 0.05:
         return True
-
     return False
 
 
@@ -1420,7 +1533,6 @@ def cluster_cells_in_tables(cells: list) -> list:
                     else:
                         clusters.append({i, j})
     list_table_cells = [[cells[idx] for idx in cl] for cl in clusters]
-
     return list_table_cells
 
 
@@ -1431,7 +1543,6 @@ def get_tables(cells: list) -> list:
         for cluster_cells in list_cluster_cells
     ]
     list_tables = [handle_merged_cells(table=table) for table in tables]
-
     return list_tables
 
 
@@ -1512,9 +1623,7 @@ def get_cells_dataframe(
             lambda x: [bound for bound in zip(sorted(x), sorted(x)[1:])] or None,
         )
     )
-
     try:
-        # Create new cells based on vertical delimiters
         df_bbox_delimiters = (
             df_bbox_delimiters[df_bbox_delimiters["dels"].notnull()]
             .explode(column="dels")
@@ -1525,11 +1634,8 @@ def get_cells_dataframe(
         )
         df_bbox_delimiters["x1_bbox"] = df_bbox_delimiters["del1"]
         df_bbox_delimiters["x2_bbox"] = df_bbox_delimiters["del2"]
-
-        # Reformat output dataframe
         df_cells = df_bbox_delimiters[["x1_bbox", "y1_bbox", "x2_bbox", "y2_bbox"]]
         df_cells.columns = ["x1", "y1", "x2", "y2"]
-
         return df_cells.reset_index()
     except ValueError:
         return pd.DataFrame(columns=["index", "x1", "y1", "x2", "y2"])
@@ -1537,30 +1643,21 @@ def get_cells_dataframe(
 
 def deduplicate_cells_vertically(df_cells: pd.DataFrame) -> pd.DataFrame:
     orig_cols = df_cells.columns
-
     df_cells = df_cells.sort_values(by=["x1", "x2", "y1", "y2"])
     df_cells["cell_rk"] = df_cells.groupby(["x1", "x2", "y1"]).cumcount()
     df_cells = df_cells[df_cells["cell_rk"] == 0]
-
     df_cells = df_cells.sort_values(
         by=["x1", "x2", "y2", "y1"], ascending=[True, True, True, False]
     )
     df_cells["cell_rk"] = df_cells.groupby(["x1", "x2", "y2"]).cumcount()
     df_cells = df_cells[df_cells["cell_rk"] == 0]
-
     return df_cells[orig_cols]
 
 
 def deduplicate_nested_cells(df_cells: pd.DataFrame) -> pd.DataFrame:
-    """
-    Deduplicate nested cells in order to keep the smallest ones
-    :param df_cells: dataframe containing cells
-    :return: dataframe containing cells after deduplication of the nested ones
-    """
     df_cells["width"] = df_cells["x2"] - df_cells["x1"]
     df_cells["height"] = df_cells["y2"] - df_cells["y1"]
     df_cells["area"] = df_cells["width"] * df_cells["height"]
-
     df_cells_cp = df_cells.copy()
     df_cells_cp.columns = [
         "index_",
@@ -1572,26 +1669,21 @@ def deduplicate_nested_cells(df_cells: pd.DataFrame) -> pd.DataFrame:
         "height_",
         "area_",
     ]
-
     df_cross_cells = df_cells.reset_index().merge(df_cells_cp, how="cross")
     df_cross_cells = df_cross_cells[df_cross_cells["index"] != df_cross_cells["index_"]]
     df_cross_cells = df_cross_cells[df_cross_cells["area"] <= df_cross_cells["area_"]]
-
     df_cross_cells["x_left"] = df_cross_cells[["x1", "x1_"]].max(axis=1)
     df_cross_cells["y_top"] = df_cross_cells[["y1", "y1_"]].max(axis=1)
     df_cross_cells["x_right"] = df_cross_cells[["x2", "x2_"]].min(axis=1)
     df_cross_cells["y_bottom"] = df_cross_cells[["y2", "y2_"]].min(axis=1)
-
     df_cross_cells["int_area"] = (
         df_cross_cells["x_right"] - df_cross_cells["x_left"]
     ) * (df_cross_cells["y_bottom"] - df_cross_cells["y_top"])
-
     df_cross_cells["contained"] = (
         (df_cross_cells["x_right"] >= df_cross_cells["x_left"])
         & (df_cross_cells["y_bottom"] >= df_cross_cells["y_top"])
         & (df_cross_cells["int_area"] / df_cross_cells["area"] >= 0.9)
     )
-
     df_cross_cells["overlapping_x"] = (
         df_cross_cells["x_right"] - df_cross_cells["x_left"]
     )
@@ -1645,7 +1737,6 @@ def deduplicate_nested_cells(df_cells: pd.DataFrame) -> pd.DataFrame:
 def deduplicate_cells(df_cells: pd.DataFrame) -> pd.DataFrame:
     df_cells = deduplicate_cells_vertically(df_cells=df_cells)
     df_cells_final = deduplicate_nested_cells(df_cells=df_cells)
-
     return df_cells_final
 
 
@@ -1658,7 +1749,6 @@ def get_cells(horizontal_lines: list, vertical_lines: list) -> list:
         Cell(x1=row["x1"], x2=row["x2"], y1=row["y1"], y2=row["y2"])
         for row in df_cells_dedup.to_dict(orient="records")
     ]
-
     return cells
 
 
@@ -1696,47 +1786,31 @@ def straightened_img(img: np.ndarray) -> tuple:
         )
     )
     if median_angle % 180 != 0:
-        # Rotate the image to straighten it
         straight_img = rotate_img(img=img, angle=median_angle)
         return straight_img, median_angle
-
     return img, 0.0
 
 
 def upside_down(img: np.ndarray) -> bool:
     height, width = img.shape
-
     top_area = 0
     bottom_area = 0
-
     for id_col in range(width):
-        # Identify black pixels in the column
         black_pixels = np.where(img[:, id_col] == 0)[0]
-
         if black_pixels.size > 0:
-            # Add column area to the totals
             top_area += np.amin(black_pixels)
             bottom_area += height - np.amax(black_pixels) - 1
-
     return top_area > bottom_area
 
 
 def fix_rotation_image(img: np.ndarray) -> np.ndarray:
     denoised = cv2.medianBlur(img.copy(), 3)
     _, thresh = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # Straighten image
     straight_thresh, angle = straightened_img(img=thresh)
-
-    # Identify if the straightened image is upside down
     is_inverted = upside_down(img=straight_thresh)
-
-    # Compute final rotation angle to apply
     rotation_angle = angle + 180 * int(is_inverted)
-
     if rotation_angle % 360 > 0:
         return rotate_img(img=img, angle=rotation_angle)
-
     return img
 
 
@@ -1789,77 +1863,488 @@ def get_title_tables(
                 if contours
                 else None
             )
-
             table.set_title(title=title)
             final_tables.append(table)
-
     return final_tables
 
 
 def cluster_to_table(cluster_cells) -> Table:
-    """
-    Convert a cell cluster to a Table object
-    :param cluster_cells: list of cells that form a table
-    :return: table with rows inferred from table cells
-    """
-    # Get list of vertical delimiters
     v_delims = sorted(list(set([y_val for cell in cluster_cells for y_val in [cell.y1, cell.y2]])))
-
-    # Get list of horizontal delimiters
     h_delims = sorted(list(set([x_val for cell in cluster_cells for x_val in [cell.x1, cell.x2]])))
-
-    # Create rows and cells
     list_rows = list()
     for y_top, y_bottom in zip(v_delims, v_delims[1:]):
         list_cells = list()
         for x_left, x_right in zip(h_delims, h_delims[1:]):
-            # Create default cell
             default_cell = Cell(x1=x_left, y1=y_top, x2=x_right, y2=y_bottom)
-
-            # Check cells that contain the default cell
             containing_cells = sorted([c for c in cluster_cells
                                        if is_contained_cell(inner_cell=default_cell, outer_cell=c, percentage=0.9)],
                                       key=lambda c: c.area)
-
-            # Append either a cell that contain the default cell, or the default cell itself
             list_cells.append(containing_cells.pop(0) if containing_cells else default_cell)
-
         list_rows.append(Row(cells=list_cells))
-
     return Table(rows=list_rows)
 
 
-def normalize_table_cells(cluster_cells):
-    """
-    Normalize cells from table cells
-    :param cluster_cells: list of cells that form a table
-    :return: list of normalized cells
-    """
-    # Compute table shape
-    width = max(map(lambda c: c.x2, cluster_cells)) - min(map(lambda c: c.x1, cluster_cells))
-    height = max(map(lambda c: c.y2, cluster_cells)) - min(map(lambda c: c.y1, cluster_cells))
+def prepare_image(img: np.ndarray) -> np.ndarray:
+    blur = cv2.GaussianBlur(img, (3, 3), 0)
+    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    dilation = cv2.dilate(thresh, (10, 10), iterations=3)
+    contours, _ = cv2.findContours(dilation, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contour_cells = list()
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        contour_cells.append(Cell(x, y, x + w, y + h))
+    contour_cells = sorted(contour_cells, key=lambda c: c.area, reverse=True)
+    if contour_cells:
+        largest_contour = None
+        if len(contour_cells) == 1:
+            largest_contour = contour_cells.pop(0)
+        elif contour_cells[0].area / contour_cells[1].area > 10:
+            largest_contour = contour_cells.pop(0)
+        if largest_contour:
+            processed_img = np.zeros(img.shape, dtype=np.uint8)
+            processed_img.fill(255)
+            cropped_img = img[largest_contour.y1:largest_contour.y2, largest_contour.x1:largest_contour.x2]
+            processed_img[largest_contour.y1:largest_contour.y2, largest_contour.x1:largest_contour.x2] = cropped_img
+            return processed_img
+    return img
 
-    # Get list of existing horizontal values
-    h_values = sorted(list(set([x_val for cell in cluster_cells for x_val in [cell.x1, cell.x2]])))
-    # Compute delimiters by grouping close values together
-    h_delims = [round(np.mean(h_group)) for h_group in
-                np.split(h_values, np.where(np.diff(h_values) >= min(width * 0.02, 10))[0] + 1)]
+def create_image_segments(img: np.ndarray, ocr_df: OCRDataframe):
+    blur = cv2.GaussianBlur(img, (5, 5), 0)
+    thresh = cv2.Canny(blur, 0, 0)
+    if ocr_df.median_line_sep is not None:
+        kernel_size = round(ocr_df.median_line_sep / 3)
+    else:
+        kernel_size = 20
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+    dilate = cv2.dilate(thresh, kernel, iterations=4)
+    margin = 10
+    back_borders = np.zeros(tuple(map(operator.add, img.shape, (2 * margin, 2 * margin))), dtype=np.uint8)
+    back_borders[margin:img.shape[0] + margin, margin:img.shape[1] + margin] = dilate
+    cnts = cv2.findContours(back_borders, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts = cnts[0] if len(cnts) == 2 else cnts[1]
+    list_cnts_cell = list()
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        x = x - margin
+        y = y - margin
+        contour_cell = Cell(x, y, x + w, y + h)
+        list_cnts_cell.append(contour_cell)
+    img_segments = merge_contours(contours=list_cnts_cell,
+                                  vertically=None)
+    return [ImageSegment(x1=seg.x1, y1=seg.y1, x2=seg.x2, y2=seg.y2) for seg in img_segments]
 
-    # Get list of existing vertical values
-    v_values = sorted(list(set([y_val for cell in cluster_cells for y_val in [cell.y1, cell.y2]])))
-    # Compute delimiters by grouping close values together
-    v_delims = [round(np.mean(v_group)) for v_group in
-                np.split(v_values, np.where(np.diff(v_values) >= min(height * 0.02, 10))[0] + 1)]
 
-    # Normalize all cells
-    normalized_cells = list()
-    for cell in cluster_cells:
-        normalized_cell = Cell(x1=sorted(h_delims, key=lambda d: abs(d - cell.x1)).pop(0),
-                               x2=sorted(h_delims, key=lambda d: abs(d - cell.x2)).pop(0),
-                               y1=sorted(v_delims, key=lambda d: abs(d - cell.y1)).pop(0),
-                               y2=sorted(v_delims, key=lambda d: abs(d - cell.y2)).pop(0))
-        # Check if cell is not empty
-        if cell.area > 0:
-            normalized_cells.append(normalized_cell)
+def get_segment_elements(img: np.ndarray, lines: list, img_segments: list, ocr_df: OCRDataframe,
+                         blur_size: int = 3) -> list:
+    blur = cv2.GaussianBlur(img, (blur_size, blur_size), 0)
+    thresh = cv2.Canny(blur, 85, 255)
+    for l in lines:
+        if l.horizontal:
+            cv2.rectangle(thresh, (l.x1 - l.thickness, l.y1), (l.x2 + l.thickness, l.y2), (0, 0, 0), 3 * l.thickness)
+        elif l.vertical:
+            cv2.rectangle(thresh, (l.x1, l.y1 - l.thickness), (l.x2, l.y2 + l.thickness), (0, 0, 0), 2 * l.thickness)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (int(1.5 * ocr_df.char_length), int(ocr_df.median_line_sep // 6)))
+    dilate = cv2.dilate(thresh, kernel, iterations=1)
+    cnts = cv2.findContours(dilate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts = cnts[0] if len(cnts) == 2 else cnts[1]
+    elements = list()
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        elements.append(Cell(x1=x, y1=y, x2=x + w, y2=y + h))
+    elements = merge_contours(contours=elements,
+                              vertically=None)
+    for seg in img_segments:
+        segment_elements = [cnt for cnt in elements if is_contained_cell(inner_cell=cnt, outer_cell=seg)]
+        seg.set_elements(elements=segment_elements)
+    return img_segments
 
-    return normalized_cells
+
+def segment_image(img: np.ndarray, lines: list, ocr_df: OCRDataframe) -> list:
+    image_segments = create_image_segments(img=img,
+                                           ocr_df=ocr_df)
+    image_segments = get_segment_elements(img=img,
+                                          lines=lines,
+                                          img_segments=image_segments,
+                                          blur_size=3,
+                                          ocr_df=ocr_df)
+    return image_segments
+
+
+def deduplicate_tables(identified_tables: list, existing_tables: list) -> list:
+    identified_tables = sorted(identified_tables, key=lambda tb: tb.area, reverse=True)
+    final_tables = list()
+    for table in identified_tables:
+        if not any([max(is_contained_cell(inner_cell=table.cell, outer_cell=tb.cell, percentage=0.1),
+                        is_contained_cell(inner_cell=tb.cell, outer_cell=table.cell, percentage=0.1))
+                    for tb in existing_tables + final_tables]):
+            final_tables.append(table)
+    return final_tables
+
+def identify_borderless_tables(img: np.ndarray, lines: list, ocr_df: OCRDataframe,
+                               existing_tables: list) -> list:
+    img_segments = segment_image(img=img,
+                                 lines=lines,
+                                 ocr_df=ocr_df)
+    tables = list()
+    for seg in img_segments:
+        seg_line_groups = identify_line_groups(segment=seg,
+                                               ocr_df=ocr_df)
+        for line_gp in seg_line_groups.line_groups:
+            col_delimiters = get_whitespace_column_delimiters(line_group=line_gp,
+                                                              segment_elements=seg_line_groups.elements)
+            table = identify_table(line_group=line_gp,
+                                   column_delimiters=col_delimiters,
+                                   lines=lines,
+                                   elements=seg_line_groups.elements)
+            if table:
+                tables.append(table)
+    return deduplicate_tables(identified_tables=tables,
+                              existing_tables=existing_tables)
+
+
+def identify_table(line_group: LineGroup, column_delimiters: list, lines: list,
+                   elements: list):
+    table = create_table(line_group=line_group,
+                         column_delimiters=column_delimiters)
+    if table is None:
+        return table
+    table_headers = process_headers(table=table, lines=lines, elements=elements)
+    for id_row, row in enumerate(table_headers.items):
+        for id_col, col in enumerate(row.items):
+            table_headers.items[id_row].items[id_col].content = None
+    return table_headers
+
+
+def process_headers(table: Table, lines: list, elements: list) -> Table:
+    table = check_header_coherency(table=table, elements=elements)
+    table_headers = headers_from_lines(table=table, lines=lines)
+    return table_headers
+
+def check_header_coherency(table: Table, elements: list) -> Table:
+    table = match_table_elements(table=table, elements=elements)
+    first_complete_row = table.items[0]
+    for row in table.items:
+        if min([c.content for c in row.items]):
+            first_complete_row = row
+            break
+    final_rows = [row for row in table.items if row.y1 >= first_complete_row.y1]
+    prev_rows = [row for row in table.items if row.y1 < first_complete_row.y1]
+    prev_rows = sorted(prev_rows, key=lambda r: r.y1, reverse=True)
+    if prev_rows:
+        complete_indices = set(range(table.nb_columns))
+        for row in prev_rows:
+            row_indices = set([idx for idx, cell in enumerate(row.items) if cell.content])
+            if len(row_indices.difference(complete_indices)) > 0:
+                break
+            final_rows.insert(0, row)
+            complete_indices = row_indices
+        return Table(rows=final_rows)
+    return table
+
+
+def identify_table_lines(table: Table, lines: list) -> list:
+    h_lines = [line for line in lines if line.horizontal]
+    y_lines = dict()
+    y_values = sorted(list(set([row.y1 for row in table.items] + [row.y2 for row in table.items])))
+    for line in h_lines:
+        matching_y = [y for y in y_values
+                      if abs(line.y1 - y) / (table.height / table.nb_rows) <= 0.25]
+        if matching_y:
+            y_val = matching_y.pop()
+            y_lines[y_val] = y_lines.get(y_val, []) + [line]
+    final_lines = list()
+    for k, v in y_lines.items():
+        x_vals = sorted(list(set([max(min(table.x2, l.x1), table.x1) for l in v]
+                                 + [max(min(table.x2, l.x2), table.x1) for l in v])))
+        total_length = sum([x_right - x_left for x_left, x_right in zip(x_vals, x_vals[1:])
+                            if any([l for l in v if min(l.x2, x_right) - max(l.x1, x_left) > 0])])
+        if total_length / table.width >= 0.75:
+            final_lines.append(k)
+    return final_lines
+
+
+def headers_from_lines(table: Table, lines: list) -> Table:
+    y_values = identify_table_lines(table=table, lines=lines)
+    dict_row_completeness = {(row.y1, row.y2): min([c.content for c in row.items]) for row in table.items}
+    top_lines = [y for y in y_values if (y - table.y1) / table.height <= 0.25][:2]
+    top_lines = sorted(list(set(top_lines if len(top_lines) == 2 else [table.y1] + top_lines)))
+    if len(top_lines) == 2:
+        if max([v for k, v in dict_row_completeness.items() if k[0] < top_lines[0]] + [False]):
+            return table
+        first_row_complete = [v for k, v in dict_row_completeness.items() if k[0] < top_lines[1]][-1]
+        if first_row_complete:
+            final_rows = [row for row in table.items if row.y1 >= top_lines[1]]
+            new_row = Row(cells=[Cell(x1=c.x1, x2=c.x2, y1=top_lines[0], y2=top_lines[1])
+                                 for c in table.items[0].items])
+            final_rows.insert(0, new_row)
+            return Table(rows=final_rows)
+    return table
+
+
+def identify_line_groups(segment: ImageSegment, ocr_df: OCRDataframe) -> ImageSegment:
+    lines = identify_lines(elements=segment.elements,
+                           ref_size=int(ocr_df.median_line_sep // 4))
+    line_groups = [line_group for h_group in create_h_pos_groups(lines=lines)
+                   for line_group in vertically_coherent_groups(lines=h_group, max_gap=ocr_df.median_line_sep)
+                   if line_group.size > 1 and not is_text_block(line_group=line_group, ocr_df=ocr_df)]
+    return ImageSegment(x1=segment.x1,
+                        y1=segment.y1,
+                        x2=segment.x2,
+                        y2=segment.y2,
+                        elements=segment.elements,
+                        line_groups=line_groups)
+
+
+def identify_trivial_delimiters(line_group: LineGroup, elements: list) -> list:
+    x_values = sorted(list(set([el.x1 for el in elements] + [el.x2 for el in elements])))
+    trivial_delimiters = list()
+    for x_left, x_right in zip(x_values, x_values[1:]):
+        overlapping_elements = [el for el in elements if min(el.x2, x_right) - max(el.x1, x_left) > 0]
+        if len(overlapping_elements) == 0:
+            delimiter = Cell(x1=x_left, x2=x_right, y1=line_group.y1, y2=line_group.y2)
+            trivial_delimiters.append(delimiter)
+    return trivial_delimiters
+
+
+def find_whitespaces(line_group: LineGroup, elements: list) -> list:
+    group_rect = Rectangle(x1=line_group.x1, y1=line_group.y1, x2=line_group.x2, y2=line_group.y2)
+    obstacles = [Rectangle.from_cell(cell=element) for element in elements]
+    queue = PriorityQueue()
+    queue.put([-group_rect.area, group_rect, obstacles])
+    covered_area = sum([o.area for o in obstacles])
+    whitespaces = list()
+    while not queue.qsize() == 0:
+        q, r, obs = queue.get()
+        if len(obs) == 0:
+            whitespaces.append(r)
+            covered_area += r.area
+            for element in queue.queue:
+                if element[1].overlaps(r):
+                    element[2] += [r]
+            continue
+        pivot = sorted(obs, key=lambda o: o.distance(r))[0]
+        rects = [Rectangle(x1=pivot.x2, y1=r.y1, x2=r.x2, y2=r.y2),
+                 Rectangle(x1=r.x1, y1=r.y1, x2=pivot.x1, y2=r.y2),
+                 Rectangle(x1=r.x1, y1=pivot.y2, x2=r.x2, y2=r.y2),
+                 Rectangle(x1=r.x1, y1=r.y1, x2=r.x2, y2=pivot.y1)]
+        for rect in rects:
+            if rect.area > group_rect.area / 1000:
+                rect_obstacles = [o for o in obs if o.overlaps(rect)]
+                queue.put([-rect.area, rect, rect_obstacles])
+    return [space.cell for space in whitespaces]
+
+
+def compute_vertical_delimiters(whitespaces: list, ref_height: int) -> list:
+    x_values = sorted(list(set([w.x1 for w in whitespaces] + [w.x2 for w in whitespaces])))
+    v_delimiters = list()
+    for x_left, x_right in zip(x_values, x_values[1:]):
+        overlapping_ws = [ws for ws in whitespaces if min(ws.x2, x_right) - max(ws.x1, x_left) > 0]
+        overlapping_ws = sorted(overlapping_ws, key=lambda ws: ws.y1 + ws.y2)
+        if overlapping_ws:
+            seq = iter(overlapping_ws)
+            ws_groups = [[next(seq)]]
+            for ws in seq:
+                if ws.y1 > ws_groups[-1][-1].y2:
+                    ws_groups.append([])
+                ws_groups[-1].append(ws)
+            for gp in [gp for gp in ws_groups if gp[-1].y2 - gp[0].y1 > ref_height * 0.75]:
+                v_delimiter = Cell(x1=x_left, x2=x_right, y1=gp[0].y1, y2=gp[-1].y2)
+                v_delimiters.append(v_delimiter)
+    if len(v_delimiters) == 0:
+        return v_delimiters
+    v_delimiters = sorted(v_delimiters, key=lambda v: v.x1 + v.x2)
+    seq = iter(v_delimiters)
+    del_groups = [[next(seq)]]
+    for delim in seq:
+        last_del = del_groups[-1][-1]
+        if (delim.x1 != last_del.x2) or (delim.y1 != last_del.y1) or (delim.y2 != last_del.y2):
+            del_groups.append([])
+        del_groups[-1].append(delim)
+    return [Cell(x1=min([el.x1 for el in del_group]),
+                 y1=min([el.y1 for el in del_group]),
+                 x2=max([el.x2 for el in del_group]),
+                 y2=max([el.y2 for el in del_group]))
+            for del_group in del_groups]
+
+
+def filter_coherent_dels(v_delimiters: list, elements: list) -> list:
+    pertinent_dels = list()
+    for v_del in v_delimiters:
+        v_overlap_els = [el for el in elements if min(v_del.y2, el.y2) - max(v_del.y1, el.y1) > 0]
+        left_elements = [el for el in v_overlap_els if el.x2 <= v_del.x1]
+        right_elements = [el for el in v_overlap_els if el.x1 >= v_del.x2]
+        if len(left_elements) > 0 and len(right_elements) > 0:
+            pertinent_dels.append(v_del)
+    if len(pertinent_dels) == 0:
+        return pertinent_dels
+    clusters = list()
+    for i in range(len(pertinent_dels)):
+        for j in range(i, len(pertinent_dels)):
+            intersect = {pertinent_dels[i].x1, pertinent_dels[i].x2}.intersection({pertinent_dels[j].x1, pertinent_dels[j].x2})
+            if len(intersect) > 0:
+                matching_clusters = [idx for idx, cl in enumerate(clusters) if {i, j}.intersection(cl)]
+                if matching_clusters:
+                    remaining_clusters = [cl for idx, cl in enumerate(clusters) if idx not in matching_clusters]
+                    new_cluster = {i, j}.union(*[cl for idx, cl in enumerate(clusters) if idx in matching_clusters])
+                    clusters = remaining_clusters + [new_cluster]
+                else:
+                    clusters.append({i, j})
+    coherent_dels = list()
+    max_height = max([delim.height for delim in pertinent_dels])
+    for cl in clusters:
+        cl_dels = [pertinent_dels[idx] for idx in cl]
+        max_height_delims = [delim for delim in cl_dels if delim.height == max_height]
+        if max_height_delims:
+            coherent_dels += max_height_delims
+            continue
+        coherent_dels.append(sorted(cl_dels, key=lambda d: (d.height, d.area)).pop())
+    y_min = max([delim.y1 for delim in coherent_dels])
+    y_max = min([delim.y2 for delim in coherent_dels])
+    return [Cell(x1=delim.x1, y1=y_min, x2=delim.x2, y2=y_max) for delim in coherent_dels
+            if delim.width >= 5]
+
+
+def get_whitespace_column_delimiters(line_group: LineGroup, segment_elements: list) -> list:
+    lg_elements = [element for element in segment_elements
+                   if is_contained_cell(inner_cell=element, outer_cell=line_group)]
+    trivial_delimiters = identify_trivial_delimiters(line_group=line_group,
+                                                     elements=lg_elements)
+    whitespaces = find_whitespaces(line_group=line_group,
+                                   elements=lg_elements+trivial_delimiters)
+
+    vertical_dels = compute_vertical_delimiters(whitespaces=whitespaces,
+                                                ref_height=line_group.height)
+    coherent_dels = filter_coherent_dels(v_delimiters=trivial_delimiters + vertical_dels,
+                                         elements=lg_elements)
+
+    return coherent_dels
+
+
+def identify_lines(elements: list, ref_size: int) -> list:
+    if len(elements) == 0:
+        return []
+    elements = sorted(elements, key=lambda c: c.y1 + c.y2)
+    seq = iter(elements)
+    tb_lines = [TableLine(cells=[next(seq)])]
+    for cell in seq:
+        if (cell.y1 + cell.y2) / 2 - tb_lines[-1].v_center > ref_size:
+            tb_lines.append(TableLine(cells=[]))
+        tb_lines[-1].add(cell)
+    dedup_lines = list()
+    for line in tb_lines:
+        overlap_lines = [l for l in tb_lines if line.overlaps(l) and not line == l]
+        if len(overlap_lines) <= 1:
+            dedup_lines.append(line)
+    merged_lines = [[l for l in dedup_lines if line.overlaps(l)] for line in dedup_lines]
+    merged_lines = [line.pop() if len(line) == 1 else line[0].merge(line[1]) for line in merged_lines]
+    return list(set(merged_lines))
+
+
+def create_h_pos_groups(lines: list) -> list:
+    clusters = list()
+    for i in range(len(lines)):
+        for j in range(i, len(lines)):
+            h_coherent = min(lines[i].x2, lines[j].x2) - max(lines[i].x1, lines[j].x1) > 0
+            if h_coherent:
+                matching_clusters = [idx for idx, cl in enumerate(clusters) if {i, j}.intersection(cl)]
+                if matching_clusters:
+                    remaining_clusters = [cl for idx, cl in enumerate(clusters) if idx not in matching_clusters]
+                    new_cluster = {i, j}.union(*[cl for idx, cl in enumerate(clusters) if idx in matching_clusters])
+                    clusters = remaining_clusters + [new_cluster]
+                else:
+                    clusters.append({i, j})
+    line_groups = [[lines[idx] for idx in cl] for cl in clusters]
+    return line_groups
+
+
+def vertically_coherent_groups(lines: list, max_gap: float) -> list:
+    lines = sorted(lines, key=lambda line: line.y1 + line.y2)
+    seq = iter(lines)
+    v_line_groups = [LineGroup(lines=[next(seq)])]
+    for line in seq:
+        if line.y1 - v_line_groups[-1].y2 > max_gap:
+            v_line_groups.append(LineGroup(lines=[]))
+        v_line_groups[-1].add(line)
+    line_groups = list()
+    for gp in [gp for gp in v_line_groups if gp.size > 1]:
+        seq = iter(gp.lines)
+        gps = [LineGroup(lines=[next(seq)])]
+        for line in seq:
+            line_gap = line.y1 - gps[-1].lines[-1].y2
+            line_sep = line.v_center - gps[-1].lines[-1].v_center
+            if (line_gap > 1.2 * gp.median_line_gap) and (line_sep > 1.2 * gp.median_line_sep):
+                gps.append(LineGroup(lines=[]))
+            gps[-1].add(line)
+        line_groups += [gp for gp in gps if max([len(line.cells) for line in gp.lines]) > 1]
+    return line_groups
+
+
+def is_text_block(line_group: LineGroup, ocr_df: OCRDataframe) -> bool:
+    nb_lines_text = 0
+    for line in line_group.lines:
+        text_line = True
+        cells = sorted(line.cells, key=lambda c: (c.x1, c.x2))
+        for prev, nextt in zip(cells, cells[1:]):
+            x_diff = nextt.x1 - prev.x2
+            if x_diff >= 2 * ocr_df.char_length:
+                text_line = False
+                break
+        nb_lines_text += int(text_line)
+    return nb_lines_text / len(line_group.lines) >= 0.5
+
+
+def match_table_elements(table: Table, elements: list) -> Table:
+    for id_row, row in enumerate(table.items):
+        for id_col, cell in enumerate(row.items):
+            table.items[id_row].items[id_col].content = max([is_contained_cell(inner_cell=el, outer_cell=cell)
+                                                             for el in elements])
+
+    return table
+
+
+def reprocess_line_group(line_group: LineGroup, column_delimiters: list) -> list:
+    y_min = min([delim.y1 for delim in column_delimiters])
+    y_max = max([delim.y2 for delim in column_delimiters])
+    filtered_lines = [line for line in line_group.lines if line.y1 >= y_min and line.y2 <= y_max]
+    filtered_lines = sorted(filtered_lines, key=lambda l: l.v_center)
+    seq = iter(filtered_lines)
+    line = next(seq)
+    new_lines = [Cell(x1=line.x1, y1=line.y1, x2=line.x2, y2=line.y2)]
+    for line in seq:
+        y_overlap = min(line.y2, new_lines[-1].y2) - max(line.y1, new_lines[-1].y1)
+        if y_overlap / min(line.height, new_lines[-1].height) >= 0.25:
+            new_lines[-1].x1 = min(new_lines[-1].x1, line.x1)
+            new_lines[-1].y1 = min(new_lines[-1].y1, line.y1)
+            new_lines[-1].x2 = max(new_lines[-1].x2, line.x2)
+            new_lines[-1].y2 = max(new_lines[-1].y2, line.y2)
+        else:
+            new_lines.append(Cell(x1=line.x1, y1=line.y1, x2=line.x2, y2=line.y2))
+    return new_lines
+
+
+def get_table(lines: list, column_delimiters: list):
+    lines = sorted(lines, key=lambda l: l.y1 + l.y2)
+    y_min = min([line.y1 for line in lines])
+    y_max = max([line.y2 for line in lines])
+    v_delims = [y_min] + [round((up.y2 + down.y1) / 2) for up, down in zip(lines, lines[1:])] + [y_max]
+    column_delimiters = sorted(column_delimiters, key=lambda l: l.x1 + l.x2)
+    x_min = min([line.x1 for line in lines])
+    x_max = max([line.x2 for line in lines])
+    x_delims = [x_min] + [round((delim.x1 + delim.x2) / 2) for delim in column_delimiters] + [x_max]
+    list_rows = list()
+    for upper_bound, lower_bound in zip(v_delims, v_delims[1:]):
+        l_cells = list()
+        for l_bound, r_bound in zip(x_delims, x_delims[1:]):
+            l_cells.append(Cell(x1=l_bound, y1=upper_bound, x2=r_bound, y2=lower_bound))
+        list_rows.append(Row(cells=l_cells))
+    table = Table(rows=list_rows)
+    return table if table.nb_rows >= 2 and table.nb_columns >= 2 else None
+
+
+def create_table(line_group: LineGroup, column_delimiters: list):
+    if len(column_delimiters) == 0:
+        return None
+    reprocessed_lines = reprocess_line_group(line_group=line_group,
+                                             column_delimiters=column_delimiters)
+    table = get_table(lines=reprocessed_lines, column_delimiters=column_delimiters)
+    return table
