@@ -7,12 +7,12 @@ from PySide6.QtCore import *
 from PySide6.QtGui import *
 from PdfCVGui.pdfviewer import MyGraphicsView
 from PdfCVGui.main import run_main
-import tabula
 
 PARENT = os.path.dirname(__file__)
 ROOT = os.path.dirname(PARENT)
 RESULTS = os.path.join(ROOT, "results")
 PDFS = os.path.join(ROOT, "pdfs")
+ASSETS = os.path.join(ROOT, "assets")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -32,17 +32,13 @@ class ToolBar(QToolBar):
         self.label = QLabel("Page -/-")
         self.singlePage.setCheckable(True)
         self.singlePage.setChecked(True)
-        self.tabulabtn = QAction()
-        self.tabulabtn.setText("Tabula")
         self.addAction(self.transferbtn)
         self.addWidget(self.singlePage)
         self.addSeparator()
-
         self.addAction(self.backbtn)
         self.addWidget(self.label)
         self.addAction(self.nextbtn)
         self.addSeparator()
-        self.addAction(self.tabulabtn)
         self.setOrientation(Qt.Horizontal)
         self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
 
@@ -60,7 +56,6 @@ class ViewerTab(QWidget):
         super().__init__(parent=parent)
         self.layout         = QVBoxLayout(self)
         self.splitter       = QSplitter(Qt.Horizontal)
-
 
         self.hlay           = QHBoxLayout()
         self.file_btn       = QPushButton("Add File(s)")
@@ -98,21 +93,13 @@ class ViewerTab(QWidget):
         self.toolbar.backbtn.triggered.connect(self.pdfview.prev_page)
         self.toolbar.transferbtn.triggered.connect(self.transfer_page)
         self.pdfview.currentPageChanged.connect(self.toolbar.change_page)
-        self.toolbar.tabulabtn.triggered.connect(self.run_tabula)
         self.showPdf.connect(self.pdfview.load_pdf)
+        self.setup_icons()
         self.procThread = None
-        self.load_icons_images()
+        self.icon_index = 0
+        self.row_active = None
+        self.processing = False
         self.load_default_folder()
-
-    def run_tabula(self):
-        for item in self.files_widget.selectedItems():
-            path = item.path
-            dfs = tabula.read_pdf(path, pages="all")
-            tabula.convert_into(path, "output.csv", output_format="csv", pages="all")
-            print(len(dfs))
-            dfs[0]
-
-
 
     def load_default_folder(self):
         if os.path.exists(PDFS):
@@ -128,13 +115,32 @@ class ViewerTab(QWidget):
             self.procThread.finished.connect(self.procThread.deleteLater)
             self.procThread.procStarted.connect(self.on_proc_started)
             self.procThread.procStopped.connect(self.on_proc_stopped)
-            self.procThread.run()
+            self.procThread.start()
+
+    def iter_icon(self):
+        if self.processing:
+            self.icon_index += 1
+            if self.icon_index >= len(self.loading_icons):
+                self.icon_index = 0
+            icon = self.loading_icons[self.icon_index]
+            item = self.files_widget.item(self.row_active)
+            item.setIcon(icon)
+            QTimer.singleShot(150, self.iter_icon)
+
 
     def on_proc_started(self, row):
-        pass
+        self.row_active = row
+        self.processing = True
+        self.icon_index = 0
+        self.files_widget.item(row).setIcon(self.loading_icons[0])
+        QTimer.singleShot(150, self.iter_icon)
+
+
 
     def on_proc_stopped(self, row):
-        pass
+        self.files_widget.item(row).setIcon(self.checked_icon)
+        self.row_active = None
+        self.processing = False
 
 
     def transfer_page(self):
@@ -165,61 +171,19 @@ class ViewerTab(QWidget):
                 item.path = fullpath
                 self.files_widget.addItem(item)
 
-    def load_icons_images(self):
-        self.pdficon = QIcon(os.path.join(ROOT, "assets", "pdf.png"))
-        self.load_icons = []
-        self.load_icon_index = 0
-        self.loading = False
-        self.loading_path = None
-        self.timer = QTimer()
-        imagepath = os.path.join(ROOT, "assets", "image")
-        for base in os.listdir(imagepath):
-            fullpath = os.path.join(imagepath, base)
-            icon = QIcon(fullpath)
-            self.load_icons.append(icon)
-
-    def iter_icon(self):
-        if not self.loading or not self.loading_path:
-            return
-        index = self.load_icon_index % len(self.load_icons)
-        icon = self.load_icons[index]
-        for i in range(self.pre_widget.count()):
-            item = self.pre_widget.item(i)
-            if item.text() != os.path.basename(self.loading_path):
-                continue
-            item.setIcon(icon)
-            self.load_icon_index += 1
-            self.timer.singleShot(400, self.iter_icon_pre)
-            break
-        return
-
     def show_pdf(self, item, prev):
         path = item.path
         self.showPdf.emit(path)
 
-    def set_load_icon(self, path):
-        self.loading = True
-        self.loading_path = path
-        self.iter_icon()
-
-    def set_pdf_icon(self, path):
-        self.loading = False
-        self.loading_path = None
-        self.load_icon_index = 0
-        icon = QIcon(os.path.join(PARENT, "assets", "pdf.png"))
-        base = os.path.basename(path)
-        return icon, base
-
-    def set_pdf_icon_pre(self, path):
-        icon, base = self.set_pdf_icon(path)
-        for i in range(self.pre_widget.count()):
-            item = self.pdf_widget.item(i)
-            if base == item.text():
-                item.setIcon(icon)
-                break
-
-    def setThreadName(self, first, last):
-        self.thread.chosen_name = first + last
+    def setup_icons(self):
+        self.pdficon = QIcon(os.path.join(ASSETS, "pdf.png"))
+        self.checked_icon = QIcon(os.path.join(ASSETS, "check.png"))
+        self.loading_icons = { }
+        parent = os.path.join(ASSETS, "Image")
+        for i, filename in enumerate(os.listdir(parent)):
+            fullpath = os.path.join(parent, filename)
+            icon = QIcon(fullpath)
+            self.loading_icons[i] = icon
 
 
 class ProcThread(QThread):
@@ -240,3 +204,6 @@ class ProcThread(QThread):
             self.procStarted.emit(row)
             run_main(path)
             self.procStopped.emit(row)
+
+    def disable(self):
+        self._active = False

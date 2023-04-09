@@ -407,27 +407,27 @@ class OCRDataframe:
 
     @property
     def median_line_sep(self):
-        df_words = self.df[self.df['class'] == 'ocrx_word']
+        df_words = self.df[self.df['class'] == 'ocrx_word'].copy()
         if df_words.shape[0] <= 1:
             return None
         df_right = pd.DataFrame({i + "_right": df_words[i] for i in df_words.columns})
         df_words["key"] = 1
         df_right["key"] = 1
         df_h_words = pd.merge(df_words, df_right, on="key").drop("key", axis=1)
-        df_h_words = df_h_words[df_h_words['id'] != df_h_words['id_right']]
-        df_h_words = df_h_words[df_h_words[['x2', 'x2_right']].min(axis=1) - df_h_words[['x1', 'x1_right']].max(axis=1) > 0]
-        df_words_below = df_h_words[df_h_words['y1'] < df_h_words['y1_right']]
-        df_words_below = df_words_below.sort_values(['id', 'y1_right'])
+        df_h_words = df_h_words[df_h_words['id'] != df_h_words['id_right']].copy()
+        df_h_words = df_h_words[df_h_words[['x2', 'x2_right']].min(axis=1) - df_h_words[['x1', 'x1_right']].max(axis=1) > 0].copy()
+        df_words_below = df_h_words[df_h_words['y1'] < df_h_words['y1_right']].copy()
+        df_words_below = df_words_below.sort_values(['id', 'y1_right']).copy()
         df_words_below['ones'] = 1
-        df_words_below['rk'] = df_words_below.groupby(df_words_below['id'])['ones'].cumsum()
-        df_words_below = df_words_below[df_words_below['rk'] == 1]
+        df_words_below['rk'] = df_words_below.groupby(df_words_below['id'])['ones'].cumsum().copy()
+        df_words_below = df_words_below[df_words_below['rk'] == 1].copy()
         median_v_dist = ((df_words_below['y1_right'] + df_words_below['y2_right'] - df_words_below['y1'] - df_words_below['y2']) / 2).median()
         return median_v_dist
 
     @property
     def char_length(self) -> float:
         try:
-            df_text_size = self.df[self.df['value'].notnull()]
+            df_text_size = self.df[self.df['value'].notnull()].copy()
             df_text_size['str_length'] = df_text_size['value'].str.len()
             df_text_size['width'] = df_text_size['x2'] - df_text_size['x1']
             char_length = df_text_size['width'].sum() / df_text_size['str_length'].sum()
@@ -1943,6 +1943,8 @@ def get_segment_elements(img: np.ndarray, lines: list, img_segments: list, ocr_d
             cv2.rectangle(thresh, (l.x1 - l.thickness, l.y1), (l.x2 + l.thickness, l.y2), (0, 0, 0), 3 * l.thickness)
         elif l.vertical:
             cv2.rectangle(thresh, (l.x1, l.y1 - l.thickness), (l.x2, l.y2 + l.thickness), (0, 0, 0), 2 * l.thickness)
+    if ocr_df.median_line_sep is None:
+        return []
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (int(1.5 * ocr_df.char_length), int(ocr_df.median_line_sep // 6)))
     dilate = cv2.dilate(thresh, kernel, iterations=1)
     cnts = cv2.findContours(dilate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)

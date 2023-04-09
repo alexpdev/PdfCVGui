@@ -1,96 +1,47 @@
 import os
 import sys
-from pathlib import Path
-import docx
-import fitz
-from docx.enum.section import WD_ORIENT
-from docx.enum.table import WD_ROW_HEIGHT_RULE, WD_TABLE_ALIGNMENT
-from docx.enum.style import WD_STYLE_TYPE
-from docx.shared import Pt
-from PdfCVGui.img import get_table_images, get_cell_images
-from PdfCVGui.ocr import Image, TesseractOCR, PDF
 import itertools
-import shutil
+from pathlib import Path
+
+import docx
+from docx.shared import Pt
+from docx.enum.section import WD_ORIENT
+from docx.enum.style import WD_STYLE_TYPE
+from docx.enum.table import WD_ROW_HEIGHT_RULE, WD_TABLE_ALIGNMENT
+
+from PdfCVGui.ocr import TesseractOCR, PDF
 
 if "MEI" not in str(Path(__file__).parent):
     PDFS = Path(__file__).parent.parent / "pdfs"
     DATA = Path(__file__).parent.parent.parent / "data"
-    RESULTS1 = Path(__file__).parent.parent / "results1"
-    RESULTS2 = Path(__file__).parent.parent / "results2"
-    TEMP = Path(__file__).parent.parent / "temp"
+    RESULTS = Path(__file__).parent.parent / "results"
 else:
     PDFS = Path(sys.executable).parent / "pdfs"
-    RESULTS1 = Path(sys.executable).parent / "results1"
-    RESULTS2 = Path(sys.executable).parent / "results2"
+    RESULTS = Path(sys.executable).parent / "results"
     TEMP = Path(sys.executable).parent / "temp"
 
-def main():
-    if not os.path.exists(PDFS):
-        return
-    for pdf in PDFS.iterdir():
-        name = pdf.name
-        if pdf.suffix != ".pdf":
-            continue
-        if not os.path.exists(RESULTS1):
-            os.mkdir(RESULTS1)
-        if not os.path.exists(RESULTS2):
-            os.mkdir(RESULTS2)
-        images = get_images_from_pdf(pdf)
-        results = get_table_images(images)
-        convert_imgs_to_docx(results, name)
-    shutil.rmtree(TEMP)
-    return True
-
 def run_main(filepath):
-    if not os.path.exists(RESULTS1):
-        os.mkdir(RESULTS1)
-    if not os.path.exists(RESULTS2):
-        os.mkdir(RESULTS2)
+    if not os.path.exists(RESULTS):
+        os.mkdir(RESULTS)
     convert_pdf_to_docx(filepath, os.path.basename(filepath))
-    images = get_images_from_pdf(filepath)
-    results = get_table_images(images)
-    convert_imgs_to_docx(results, os.path.basename(filepath))
 
-def get_images_from_pdf(path):
-    name = path.name
-    doc = fitz.open(str(path))
-    mat = fitz.Matrix(2.0, 2.0)
-    lst = []
-    if not os.path.exists(TEMP):
-        os.mkdir(TEMP)
-    for i, page in enumerate(doc.pages()):
-        pix = page.get_pixmap(matrix=mat)
-        filename = TEMP / (name + str(i) + ".png")
-        pix.save(str(filename))
-        lst.append(str(filename))
-    return lst
 
 def convert_pdf_to_docx(path, name):
     ocr = TesseractOCR(3, "eng")
     pdf = PDF(str(path))
-    tables = pdf.extract_tables(ocr=ocr, implicit_rows=True)
+    tables = pdf.extract_tables(
+        ocr=ocr,
+        implicit_rows=True,
+        borderless_tables=True
+    )
     doc = docx.Document()
     for section in doc.sections:
         section.orientation = WD_ORIENT.LANDSCAPE
-        section.page_height, section.page_width = section.page_width, section.page_height + 4
+        section.page_height, section.page_width = section.page_width + 10, section.page_height + 25
     for idx, tables in tables.items():
         for table in tables:
             add_table(doc, table)
-    doc.save(str(RESULTS2 / (name + ".docx")))
-
-def convert_imgs_to_docx(results, name):
-    ocr = TesseractOCR(3, "eng")
-    doc = docx.Document()
-    for section in doc.sections:
-        section.orientation = WD_ORIENT.LANDSCAPE
-        section.page_height, section.page_width = section.page_width, section.page_height + 4
-    for imgs in results:
-        for i in imgs:
-            image = Image(i)
-            tables = image.extract_tables(ocr=ocr)
-            for table in tables:
-                add_table(doc, table)
-    doc.save(str(RESULTS1 / (name + ".docx")))
+    doc.save(str(RESULTS / (name + ".docx")))
 
 def add_table(doc, table):
     data = {}
@@ -106,10 +57,11 @@ def add_table(doc, table):
     tab = doc.add_table(cols=maxc+1, rows=maxr+ 1)
     tab.style = "Table Grid"
     tab.alignment = WD_TABLE_ALIGNMENT.CENTER
-    tab.autofit = True
+    tab.autofit = False
+    tab.allow_autofit = False
     for row in tab.rows:
-        row.height_rule = WD_ROW_HEIGHT_RULE.AT_LEAST
-        row.height = Pt(12)
+        row.height_rule = WD_ROW_HEIGHT_RULE.EXACTLY
+        row.height = Pt(0)
     for c in data.values():
         if len(c) == 1:
             pos = c.pop()

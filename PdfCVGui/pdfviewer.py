@@ -1,7 +1,7 @@
 from PySide6.QtWidgets import *
 from PySide6.QtCore import *
 from PySide6.QtGui import *
-from PySide6.QtPdf import QPdfDocument
+from PySide6.QtPdf import *
 
 DEFAULT_COLOR = Qt.black
 DEFAULT_THICKNESS = 2
@@ -17,6 +17,7 @@ class MyGraphicsView(QGraphicsView):
         self.page_number = 1
         self.page_count = None
         self.document = None
+        self.pixitem = None
         self.setRenderHint(QPainter.Antialiasing)
         self.setDragMode(QGraphicsView.NoDrag)
         self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
@@ -46,11 +47,14 @@ class MyGraphicsView(QGraphicsView):
 
     def updateBackground(self):
         if self.document is not None:
-            image = self.document.render(self.page_number, self.viewport().size())
+            if self.pixitem:
+                self.scene().removeItem(self.pixitem)
+            psize = self.document.pagePointSize(self.page_number)
+            image = self.document.render(self.page_number, psize.toSize())
             pixmap = QPixmap.fromImage(image)
-            brush = QBrush(pixmap)
-            self.scene().setBackgroundBrush(brush)
-            self.scene().setSceneRect(0,0, self.width() - 5, self.height() - 5)
+            self.pixitem = QGraphicsPixmapItem(pixmap)
+            self.scene().addItem(self.pixitem)
+            self.pixitem.setPos(QPoint(0,0))
 
     def resizeEvent(self, event):
         self.updateBackground()
@@ -60,6 +64,3 @@ class MyGraphicsView(QGraphicsView):
             self.next_page()
         elif event.key() == Qt.Key_Left or event.key() == Qt.Key_P:
             self.prev_page()
-
-    def drawBackground(self, painter, rect):
-        return super().drawBackground(painter, rect)

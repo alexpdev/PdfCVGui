@@ -6,7 +6,7 @@ import xxhash
 from PySide6.QtWidgets import *
 from PySide6.QtCore import *
 from PySide6.QtGui import *
-from PdfCVGui.img import extract_tables, extract_cells, table_image
+
 import subprocess
 import tempfile
 import parsel
@@ -146,7 +146,6 @@ class PreProcTab(QWidget):
         self.list_widget.currentItemChanged.connect(self.highlight_label)
         self.list_widget.sizePolicy().setHorizontalPolicy(QSizePolicy.Policy.Fixed)
         self.list_widget.installEventFilter(self)
-        self.setToolbar2()
 
     def extract_text(self, img):
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
@@ -394,50 +393,3 @@ class PreProcTab(QWidget):
             listitem.setText(filename + f"-p{i}")
             self.list_widget.addItem(listitem)
             self.add_image_to_grid(img, listitem)
-
-
-    def setToolbar2(self):
-        self.img_table_finder_btn = QToolButton(self)
-        self.img_table_finder_btn.setText("Image Table Finder")
-        self.img_cell_finder_btn = QToolButton(self)
-        self.img_cell_finder_btn.setText("Image Cell Finder")
-        self.toolbar2.addWidget(self.img_table_finder_btn)
-        self.toolbar2.addWidget(self.img_cell_finder_btn)
-        self.toolbar2.addSeparator()
-        self.pd_table_finder_btn = QToolButton(self)
-        self.pd_table_finder_btn.setText("DataFrame Table Finder")
-        self.pd_cell_finder_btn = QToolButton(self)
-        self.pd_cell_finder_btn.setText("DataFrame Cell Finder")
-        self.toolbar2.addWidget(self.pd_table_finder_btn)
-        self.toolbar2.addWidget(self.pd_cell_finder_btn)
-        self.pd_table_finder_btn.clicked.connect(self.find_table_dataframes)
-        self.img_table_finder_btn.clicked.connect(self.find_image_tables)
-        self.pd_cell_finder_btn.clicked.connect(self.find_cells_dataframes)
-        self.img_cell_finder_btn.clicked.connect(self.find_image_cells)
-
-    def find_table_dataframes(self):
-        item = self.get_selected_item()
-
-    def find_image_tables(self):
-        item = self.get_selected_item()
-        bounding_rects = extract_tables(item.image)
-        for i, rect in enumerate(bounding_rects):
-            image = table_image(item.image, rect)
-            child = QListWidgetItem()
-            child.setText(item.text() + f"-extracted_table{i}")
-            child.image = image
-            self.add_image_to_grid(image, child)
-            self.list_widget.addItem(child)
-
-    def find_cells_dataframes(self):
-        item = self.get_selected_item()
-
-    def find_image_cells(self):
-        item = self.get_selected_item()
-        images = extract_cells(item.image)
-        for i, image in enumerate(images):
-            child = QListWidgetItem()
-            child.setText(item.text() + f"-extract_cells{i}")
-            child.image = image
-            self.add_image_to_grid(image, child)
-            self.list_widget.addItem(child)
