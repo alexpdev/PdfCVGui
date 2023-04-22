@@ -164,9 +164,13 @@ class PreProcTab(QWidget):
         nimg = img.copy()
         for elem in response.xpath("//span[@class='ocrx_word']"):
             bbox = elem.xpath("./@title").get()
+            conf = bbox.split(";")[1].strip()
             bbox = bbox[4:bbox.index(";")]
             rect = [int(i) for i in bbox.split()]
-            nimg[rect[1]+1:rect[3]-1, rect[0]+1:rect[2]-1] = 255
+            val = int(conf.split()[1])
+            if val < 70:
+                continue
+            nimg[rect[1]-1:rect[3]+1, rect[0]-1:rect[2]+1] = 255
         child = QListWidgetItem()
         child.setText(item.text() + "-ocred")
         child.image = nimg
@@ -304,6 +308,20 @@ class PreProcTab(QWidget):
         self.extract_button.clicked.connect(self.ocr_img)
         self.toolbar.addWidget(self.extract_button)
         self.toolbar.addSeparator()
+        self.hsvbtn = QToolButton()
+        self.hsvbtn.setText("HSV")
+        self.hsvbtn.clicked.connect(self.hsv_apply)
+        self.toolbar.addWidget(self.hsvbtn)
+        self.toolbar.addSeparator()
+        self.mask_groupbox = QGroupBox()
+        self.mask_layout = QHBoxLayout()
+        self.mask_groupbox.setLayout(self.mask_layout)
+        self.mask_spinbox1 = QSpinBox()
+        self.maskbtn = QToolButton()
+        self.maskbtn.setText("Mask")
+        self.toolbar.addWidget(self.maskbtn)
+        self.maskbtn.clicked.connect(self.apply_mask)
+        self.toolbar.addSeparator()
         self.thresh_std_layout.setSpacing(6)
         self.thresh_std_layout.setContentsMargins(3,1,3,1)
         self.dilate_layout.setSpacing(6)
@@ -312,6 +330,34 @@ class PreProcTab(QWidget):
         self.blur_layout.setContentsMargins(3,1,3,1)
         self.thresh_layout.setSpacing(6)
         self.thresh_layout.setContentsMargins(3,1,3,1)
+
+    def apply_mask(self):
+        item = self.get_selected_item()
+        if not item: return
+        img = item.image
+        lower = np.array([90,38,0])
+        upper = np.array([145,255,255])
+        mask = cv2.inRange(img, lower, upper)
+        child = QListWidgetItem()
+        child.setText(item.text() + f"-thresh.std")
+        child.image = mask
+        self.add_image_to_grid(mask, child)
+        self.list_widget.addItem(child)
+
+
+    def hsv_apply(self):
+        item = self.get_selected_item()
+        if not item: return
+        img = item.image
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        child = QListWidgetItem()
+        child.setText(item.text() + f"-thresh.std")
+        child.image = hsv
+        self.add_image_to_grid(hsv, child)
+        self.list_widget.addItem(child)
+
+
+
 
 
     def thresh_std(self):
